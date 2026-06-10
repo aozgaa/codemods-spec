@@ -291,6 +291,7 @@ PENDING ──claim──▶ RUNNING ──ok+diff──▶ MODDED ──claim�
 | VERIFYING | MODDED | crash recovery: claim expired |
 | MODDED, VERIFIED | PENDING | doctor: required worktree missing (§7 check 2) |
 | VERIFIED | PR_OPEN | branch pushed, review opened; review URL recorded |
+| VERIFIED | FAILED | publish error: push or review creation failed |
 | VERIFIED | VERIFIED | no `review` block configured (rest state) |
 | PR_OPEN | MERGED | review driver reports merged |
 | PR_OPEN | ABANDONED | review driver reports closed without merge |

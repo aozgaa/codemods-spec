@@ -34,6 +34,7 @@ TRANSITIONS: set[tuple[str, str]] = {
     (VERIFYING, FAILED),
     (VERIFYING, MODDED),     # crash recovery
     (VERIFIED, PR_OPEN),
+    (VERIFIED, FAILED),      # publish error: push or review creation failed
     (PR_OPEN, MERGED),
     (PR_OPEN, ABANDONED),
     (FAILED, PENDING),       # retry

@@ -222,14 +222,18 @@ class Engine:
                 driver = self.review_driver(cfg)
                 if not Path(sub["worktree"] or "").exists():
                     return out("worktree missing; run `codemods doctor --fix`", "warning")
-                push_url = cfg.review.push_url or cfg.repo
-                wt.push(Path(sub["worktree"]), push_url, sub["branch"])
-                url = driver.open(
-                    cfg.review, sub["branch"], cfg.base_branch,
-                    cfg.review.title.format(codemod=cfg.name, unit=unit),
-                    cfg.review.body.format(codemod=cfg.name, unit=unit))
-                db.transition(self.conn, sub, st.PR_OPEN, pr_url=url)
-                return out(f"opened review {url}")
+                try:
+                    push_url = cfg.review.push_url or cfg.repo
+                    wt.push(Path(sub["worktree"]), push_url, sub["branch"])
+                    url = driver.open(
+                        cfg.review, sub["branch"], cfg.base_branch,
+                        cfg.review.title.format(codemod=cfg.name, unit=unit),
+                        cfg.review.body.format(codemod=cfg.name, unit=unit))
+                    db.transition(self.conn, sub, st.PR_OPEN, pr_url=url)
+                    return out(f"opened review {url}")
+                except Exception as e:
+                    db.transition(self.conn, sub, st.FAILED, error=str(e))
+                    return out(f"publish errored: {e}")
 
             case st.PR_OPEN:
                 driver = self.review_driver(cfg)

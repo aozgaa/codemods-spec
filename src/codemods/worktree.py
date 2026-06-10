@@ -73,4 +73,7 @@ def head_is_base(path: Path, base_branch: str) -> bool:
 
 
 def push(path: Path, push_url: str, branch: str) -> None:
-    _git(path, "push", "--force-with-lease", push_url, f"{branch}:{branch}")
+    # Plain --force: codemods/* branches are system-owned, each push comes
+    # from a fresh clone (no remote-tracking info for a lease), and the
+    # claim discipline already guarantees a single writer per subtask.
+    _git(path, "push", "--force", push_url, f"{branch}:{branch}")
