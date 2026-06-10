@@ -1,5 +1,5 @@
 #!/bin/sh
-# Codemod run script (SPEC.md §4): argv[1] = one lib/vauth/*.c file.
+# Codemod run script (EXAMPLE_SPEC.md §4): argv[1] = one lib/vauth/*.c file.
 # curl carries no .clang-tidy, so the check set is pinned here: a single
 # mechanical, fixit-capable check appropriate for C.
 set -eu

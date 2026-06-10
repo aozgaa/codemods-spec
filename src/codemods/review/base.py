@@ -1,4 +1,4 @@
-"""Review driver interface (SPEC.md §9)."""
+"""Review driver interface (EXAMPLE_SPEC.md §9)."""
 
 from __future__ import annotations
 

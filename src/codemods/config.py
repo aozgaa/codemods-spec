@@ -1,4 +1,4 @@
-"""Parse and validate codemod HCL configuration (SPEC.md §3)."""
+"""Parse and validate codemod HCL configuration (EXAMPLE_SPEC.md §3)."""
 
 from __future__ import annotations
 
@@ -202,7 +202,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9._-]+")
 
 
 def slugify(unit: str, taken: set[str] | None = None, maxlen: int = 60) -> str:
-    """Unit slug per SPEC.md §3.3."""
+    """Unit slug per EXAMPLE_SPEC.md §3.3."""
     slug = _SLUG_RE.sub("-", unit.lower()).strip("-")
     slug = re.sub(r"-{2,}", "-", slug)[:maxlen] or "unit"
     if taken is not None:

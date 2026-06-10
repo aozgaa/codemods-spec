@@ -1,4 +1,4 @@
-"""Subtask state machine (SPEC.md §5)."""
+"""Subtask state machine (EXAMPLE_SPEC.md §5)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ ALL_STATES = {PENDING, RUNNING, MODDED, VERIFYING, VERIFIED, PR_OPEN,
               MERGED, NOOP, FAILED, ABANDONED}
 TERMINAL = {MERGED, NOOP, ABANDONED}
 # In-flight states protected by a claim; mapping to the state a stale claim
-# recovers to (SPEC.md §5.2).
+# recovers to (EXAMPLE_SPEC.md §5.2).
 CLAIMED_RECOVERY = {RUNNING: PENDING, VERIFYING: MODDED}
 
 TRANSITIONS: set[tuple[str, str]] = {

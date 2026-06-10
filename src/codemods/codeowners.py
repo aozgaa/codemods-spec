@@ -1,4 +1,4 @@
-"""GitHub-format CODEOWNERS parsing (SPEC.md §3.2, type "codeowners").
+"""GitHub-format CODEOWNERS parsing (EXAMPLE_SPEC.md §3.2, type "codeowners").
 
 Maps each repository file to its owners using last-match-wins semantics,
 then inverts to {owner: [files]}.

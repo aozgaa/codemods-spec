@@ -1,4 +1,4 @@
-"""Evaluate decomposition blocks into unit lists (SPEC.md §3.2)."""
+"""Evaluate decomposition blocks into unit lists (EXAMPLE_SPEC.md §3.2)."""
 
 from __future__ import annotations
 

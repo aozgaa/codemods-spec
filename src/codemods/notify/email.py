@@ -1,4 +1,4 @@
-"""SMTP email notifier (SPEC.md §9, §11).
+"""SMTP email notifier (EXAMPLE_SPEC.md §9, §11).
 
 The demo points `smtp` at a local aiosmtpd sink (`pixi run smtp-sink`);
 production points it at a real relay. CODEMODS_SMTP overrides the config.

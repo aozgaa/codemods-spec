@@ -1,476 +1,206 @@
 # Codemods — Specification
 
-Version 0.1 (draft). The key words MUST, MUST NOT, SHOULD, and MAY are to be
+Version 0.2 (draft). The key words MUST, SHOULD, and MAY are to be
 interpreted as in RFC 2119.
 
-## 1. Overview
+This document describes the philosophy and architecture of **codemods**: a
+system for landing large mechanical changes in large organizations by
+splitting them into independently reviewable units. It deliberately avoids
+prescribing technologies. A companion document,
+[EXAMPLE_SPEC.md](EXAMPLE_SPEC.md), makes every choice concrete for the
+reference implementation that ships in this repository; treat this document
+as the contract an implementation must honor, and EXAMPLE_SPEC.md as one
+fully worked instantiation of it.
 
-Large mechanical changes — a `clang-tidy -fix` sweep, an API rename, a header
-reshuffle — are easy to *generate* but hard to *land* in a large organization.
-Applied in one commit, the review request fans out to every code-owner group it
-touches; a single change can demand sign-off from 100+ reviewers and stalls
-indefinitely.
+## 1. Motivation
 
-**Codemods** is a system that splits such a change into small, independently
-reviewable units, runs the transformation per unit in an isolated checkout,
-verifies each result, opens one review per unit, and tracks every unit through
-its full lifecycle (run → verify → review → merged/abandoned) in a database.
+Large mechanical changes — a `clang-tidy -fix` sweep, an API rename, a
+header reshuffle, a lint-rule rollout — are easy to *generate* and hard to
+*land*. Applied as one commit in an organization with 1000+ engineers, the
+review fans out to every code-owner group the change touches; a single
+change can demand sign-off from 100+ reviewers, stall indefinitely, and rot
+against a moving main branch.
 
-This document specifies the system's behavior and the contracts between its
-components so that organizations can implement it against their own
-software-development-lifecycle stacks (their SCM hosting, review tool, ticket
-tracker, notification channels). A sample implementation accompanies this spec
-(see §10) targeting git + GitHub + email + PostgreSQL.
+The fix is social as much as technical: deliver each owner a review scoped
+to what they own, small enough to be read, while a machine tracks the
+long tail — the run that failed, the review nobody answered, the directory
+that vanished in a refactor — for weeks if necessary. Codemods is that
+machine.
 
-### Goals
+## 2. Philosophy
 
-- Decompose a repository-wide change into per-unit subtasks (per file, per
-  directory, per build target, per code-owner group, …).
-- Execute user-supplied transformation and verification scripts per unit in
-  isolated checkouts.
-- Persist all lifecycle state in a database; every operation is restartable
-  and idempotent. Killing the orchestrator at any point MUST NOT lose or
-  corrupt state.
-- Open and track one code review per unit; react to review outcomes via hooks
-  (notification, cleanup).
-- Provide operator tooling to inspect, repair, and abandon in-flight work.
+**The unit of work is the unit of review.** A campaign is decomposed by
+whatever boundary the organization reviews along — a file, a directory, a
+build target, a code-owner group. Everything downstream (execution,
+verification, review, notification) happens per unit, so no reviewer ever
+faces more than their own slice.
 
-### Non-goals
+**Bespoke logic lives in scripts; orchestration lives in the system.** Every
+organization builds, tests, and selects tests differently. Codemods does not
+model any of that: the transformation (*run*) and verification (*postmod*)
+are opaque executables supplied by the campaign author, with a deliberately
+tiny contract (§5). The orchestrator only knows how to schedule them,
+observe their exit codes, and capture what they changed.
 
-- Authoring the transformations themselves. Codemods runs opaque scripts; it
-  is not a refactoring engine.
-- Merge queues, CI orchestration, or replacing the organization's review
-  process. Codemods *feeds* that process.
-- Cross-unit dependency ordering. Units are assumed independent; if two units
-  conflict, normal review/rebase resolves it.
+**All state lives in a durable store; processes are disposable.** The
+orchestrator is a *reconciler*: each invocation reads the store, advances
+whatever can be advanced, and exits. Killing it at any instant MUST NOT lose
+or corrupt state — progress checkpoints are written *before* effects where a
+re-run is cheap, and *after* effects where a re-run must be avoided.
+Long-lived daemons, cron jobs, and one-shot CLI runs are all valid drivers
+of the same state machine.
 
-## 2. Concepts
+**Every step is idempotent from its checkpoint.** Recovery from a crash is
+re-running the step, never replaying history. Steps that create external
+artifacts (a pushed branch, an open review) MUST detect an artifact created
+by a previous, interrupted attempt and adopt it rather than duplicate it.
 
-| Term | Definition |
+**Adaptation happens at named seams, not by forking the orchestrator.**
+Everything organization-specific — version control, review tooling,
+notification channels, machine provisioning, the state store itself — sits
+behind a driver interface (§6). A conforming implementation swaps drivers;
+the lifecycle, guarantees, and operator surface stay recognizably the same.
+
+**Operators see and repair everything.** Reality drifts from the database:
+reviews get closed by hand, checkouts get deleted, owners disappear from
+CODEOWNERS. The system MUST expose its full state for inspection, record an
+append-only audit trail, and ship a *doctor* that detects drift and — only
+when asked — repairs it.
+
+## 3. System model
+
+| Concept | Definition |
 |---|---|
 | **Codemod** | A named, registered change campaign: configuration + a *run* script + an optional *postmod* script + a decomposition rule. |
-| **Unit** | One item produced by decomposition (a path, a target name, an owner). Identified by its literal string value. |
-| **Subtask** | The lifecycle record of one unit within one codemod: a database row carrying state, branch, review URL, logs, and claim metadata. |
-| **Worktree** | An isolated checkout of the target repository in which one subtask's scripts execute. |
-| **Driver** | A pluggable adapter: review driver (open/poll/close reviews), notify driver (deliver messages), decomposer (produce units), worktree provider (produce checkouts). |
-| **Reconciler** | The engine that advances every non-terminal subtask toward a terminal state. Each invocation observes current state and performs the next step; it never relies on in-memory state surviving between invocations. |
+| **Unit** | One item produced by decomposition (a path, a target, an owner). Identified by its literal string value, unique within its codemod. |
+| **Subtask** | The durable lifecycle record of one unit within one codemod: state, workspace and review references, attempt count, logs, claim metadata. |
+| **Workspace** | An isolated, writable checkout of the target repository in which one subtask's scripts execute (a "worktree" in the git sense, a VM or container in others). |
+| **Driver** | A pluggable adapter for one organization-specific seam (§6). |
+| **Reconciler** | The engine that advances every non-terminal subtask toward a terminal state, one observable, durable step at a time. |
 
-## 3. Configuration
-
-A codemod is defined in an [HCL](https://github.com/hashicorp/hcl) file. HCL
-was chosen for its regular block syntax, native lists/maps, heredocs for
-embedded shell, and comments. Implementations MAY accept alternate formats;
-HCL is used here as a concrete example.
-
-### 3.1 Schema
-
-```hcl
-codemod "clang-tidy-fix" {
-  description = "Apply clang-tidy fixes, one src subdirectory at a time"
-
-  # Where worktrees are cloned from. Local path or URL, anything the
-  # implementation's SCM tooling can clone.
-  repo        = "/path/to/public-repo"
-  base_branch = "main"
-
-  # Branches are named <branch_prefix>/<codemod-name>/<unit-slug>.
-  branch_prefix = "codemods"
-
-  # Where worktrees and per-subtask logs are created.
-  # Relative paths resolve against the config file's directory.
-  workdir = "./work"
-
-  # Example of one way to fan out work. Other possible mechanisms
-  # are described below
-  decomposition {
-    type    = "glob"
-    # match each subdir under src/ into a separate unit
-    include = ["src/*"]
-    kind    = "directory"
-  }
-
-  # Transformation script. argv[1] = unit. Exit 0 = success.
-  run = "./mods/clang-tidy-fix.sh"
-
-  # Optional verification script (build, tests). Same contract.
-  postmod = "./mods/build-and-test.sh"
-
-  review {
-    driver    = "github"
-    repo      = "example/public-repo"                 # driver-specific target
-    push_url  = "git@github.com:example/public-repo.git" # where branches are pushed
-    title     = "[codemods] {codemod}: {unit}"
-    body      = "Automated change `{codemod}` applied to `{unit}`."
-    reviewers = []          # driver-specific reviewer handles
-    draft     = false
-  }
-
-  notify {
-    driver = "email"
-    to     = ["owner@example.com"]
-    from   = "codemods@example.com"
-    smtp   = "localhost:8025"        # driver-specific
-    on     = ["failed", "pr_open", "merged", "abandoned"]
-  }
-}
-```
-
-Top-level keys `repo`, `base_branch`, `run`, and one `decomposition` block are
-REQUIRED. `branch_prefix` defaults to `codemods`; `workdir` defaults to
-`./work`; `postmod`, `review`, and `notify` are OPTIONAL (a codemod without a
-`review` block stops at VERIFIED — useful for dry runs).
-
-Relative paths (`run`, `postmod`, `workdir`, codeowners `path`) resolve
-against the directory containing the config file.
-
-`title` and `body` are templates; implementations MUST substitute `{codemod}`
-and `{unit}`.
-
-### 3.2 Decomposition types
-
-Exactly one `decomposition` block per codemod. Decomposition is evaluated at
-**registration time** against the content of `repo` (implementations SHOULD
-evaluate against a clean checkout of `base_branch`). Re-running `register`
-re-evaluates; see §8 for drift handling.
-
-**`literal`** — explicit list.
-
-```hcl
-decomposition {
-  type  = "literal"
-  items = ["src/app", "src/lib", "src/tools"]
-}
-```
-
-**`glob`** — shell-style globs relative to the repository root. `kind`
-restricts matches to `"directory"`, `"file"`, or `"any"` (default). `exclude`
-globs are removed from the result.
-
-```hcl
-decomposition {
-  type    = "glob"
-  include = ["src/*"]
-  exclude = ["src/meta"]
-  kind    = "directory"
-}
-```
-
-**`command`** — arbitrary command executed with the repository root as
-working directory; its stdout is split into units. `format` is `"lines"`
-(default, one unit per non-empty line) or `"nul"` (NUL-delimited, for
-filenames containing newlines).
-
-```hcl
-decomposition {
-  type    = "command"
-  command = "find src -maxdepth 1 -mindepth 1 -type d -print0"
-  format  = "nul"
-}
-```
-
-**`codeowners`** — parse a GitHub-format CODEOWNERS file; each distinct owner
-becomes one unit (the owner string, e.g. `@org/payments-team`). The set of
-repository files owned by that owner (last-match-wins semantics, as GitHub
-evaluates them) is passed to the scripts via `CODEMODS_UNIT_FILES` (§4).
-
-```hcl
-decomposition {
-  type = "codeowners"
-  path = ".github/CODEOWNERS"
-}
-```
-
-Unit strings MUST be unique within a codemod. Implementations MUST reject a
-decomposition that yields duplicates, and SHOULD reject one that yields zero
-units.
-
-### 3.3 Unit slugs
-
-Each unit gets a *slug* used in branch and directory names: the unit string
-lowercased, with every character outside `[a-z0-9._-]` replaced by `-`,
-collapsed runs of `-`, trimmed to 60 characters. If two units in one codemod
-slug identically, a numeric suffix (`-2`, `-3`, …) disambiguates
-deterministically by registration order.
-
-## 4. Script contract
-
-Both `run` and `postmod` are executables (typically shell scripts) invoked
-as:
-
-- **argv[1]** — the unit string.
-- **cwd** — the worktree root.
-- **environment** — inherited, plus:
-  - `CODEMODS_NAME` — codemod name
-  - `CODEMODS_UNIT` — unit string (same as argv[1])
-  - `CODEMODS_WORKTREE` — absolute worktree path
-  - `CODEMODS_BASE_BRANCH` — base branch name
-  - `CODEMODS_UNIT_FILES` — (codeowners decomposition only) path to a
-    NUL-delimited file listing the unit's owned files
-
-Exit status 0 means success; anything else means failure and moves the
-subtask to FAILED. stdout and stderr MUST be captured to a per-subtask log
-file recorded in the database.
-
-After a successful `run`, the orchestrator inspects the worktree:
-
-- **No change** to tracked or untracked-and-unignored files → the subtask is
-  **NOOP** (terminal). No commit, no review.
-- **Changes present** → the orchestrator commits all non-ignored changes on
-  the subtask branch. Scripts MUST confine build artifacts to gitignored
-  locations; anything not ignored is considered part of the change.
-
-`postmod` verifies the committed change (configure, build, run tests —
-including any bespoke repo-specific test-selection logic). If `postmod`
-leaves additional non-ignored modifications (e.g. a formatter pass), the
-orchestrator amends them into the subtask commit.
-
-Scripts MUST be safe to re-run from a fresh checkout: on crash recovery the
-orchestrator discards the worktree and re-executes from scratch (§5.2).
-
-## 5. Subtask lifecycle
-
-### 5.1 States and transitions
+The flow of one subtask:
 
 ```
-                        ┌────────── retry ───────────┐
-                        ▼                            │
-PENDING ──claim──▶ RUNNING ──ok+diff──▶ MODDED ──claim──▶ VERIFYING ──ok──▶ VERIFIED
-                      │   └─ok+empty─▶ NOOP*              │                    │
-                      └──fail──▶ FAILED ◀───── fail ──────┘                 open PR
-                                                                               ▼
-                MERGED* ◀──merged── PR_OPEN ──closed unmerged──▶ ABANDONED*
+decompose ─▶ pending ─▶ transform (run script in fresh workspace)
+                           │  no change ─▶ done (noop)
+                           ▼
+                        verify (postmod script)
+                           ▼
+                        publish branch + open review
+                           ▼
+            poll review ─▶ merged ▷ done   /   declined ▷ abandoned
+        (failures at any step are recorded, notified, and retryable)
 ```
 
-`*` = terminal. Full transition table (normative):
+## 4. Lifecycle guarantees
 
-| From | To | Trigger |
+Implementations choose their own state names and storage (EXAMPLE_SPEC.md §5
+and §6 give a complete worked state machine and schema); whatever the
+representation, the following are normative:
+
+- **Durability.** Entering and leaving a work-in-flight phase MUST be
+  persisted: the store records that a script is about to run before it
+  runs, and records the outcome only once its effects (e.g. a commit)
+  exist.
+- **Mutual exclusion.** Work-in-flight phases are protected by a *claim* —
+  an owner identity plus a lease — acquired with an atomic compare-and-swap,
+  so concurrent reconcilers sharing one store never double-run a subtask.
+- **Crash recovery.** A subtask whose claim expired (or whose owner is
+  provably dead) is recovered automatically: its workspace is discarded and
+  it re-enters the last safe phase. Scripts MUST therefore tolerate being
+  re-run from a fresh workspace.
+- **Empty changes are first-class.** A transformation that changes nothing
+  terminates the subtask as a no-op — no commit, no review, no reviewer
+  interruption.
+- **Review outcomes drive terminal states.** Merged ends the subtask
+  successfully; closed-without-merge abandons it. Operators can retry
+  failures and abandon anything, and abandoning closes any open review.
+- **Notifications fire exactly once per subtask per event**, with delivery
+  outcome recorded; failed deliveries are retried on later reconciliations.
+- **Audit.** Every state change, repair, and notification is recorded in an
+  append-only event log.
+
+## 5. The script contract
+
+This is the universal interface between the orchestrator and the
+organization's bespoke logic, and it is intentionally minimal:
+
+- The *run* and *postmod* scripts are executables invoked with **one
+  argument — the unit** — and the workspace root as working directory.
+- **Exit 0 means success**; anything else fails the subtask.
+- The orchestrator passes context through environment variables (at minimum
+  the codemod name, the unit, the workspace path, and the base revision; a
+  codeowners-style decomposition also supplies the unit's file list).
+- The *run* script's product is whatever it leaves changed in the
+  workspace; the orchestrator commits it. Artifacts that must not land in
+  review go in ignored locations.
+- *postmod* verifies the committed change — build, tests, whatever
+  repo-specific selection logic the organization encodes. Modifications it
+  leaves (e.g. a formatter pass) are folded into the change.
+- Script output MUST be captured to per-subtask logs reachable from the
+  subtask record.
+
+## 6. Adaptation points
+
+These are the seams along which organizations differ; each is a driver
+interface in a conforming implementation. EXAMPLE_SPEC.md §9 gives concrete
+signatures.
+
+| Seam | What varies | What the contract must preserve |
 |---|---|---|
-| PENDING | RUNNING | reconciler claims subtask; worktree prepared; `run` starts |
-| RUNNING | MODDED | `run` exited 0, diff non-empty, commit created |
-| RUNNING | NOOP | `run` exited 0, no changes |
-| RUNNING | FAILED | `run` exited non-zero, or worktree/setup error |
-| RUNNING | PENDING | crash recovery: claim expired (§5.2) |
-| MODDED | VERIFYING | reconciler claims subtask; `postmod` starts |
-| MODDED | VERIFIED | no `postmod` configured |
-| VERIFYING | VERIFIED | `postmod` exited 0 |
-| VERIFYING | FAILED | `postmod` exited non-zero |
-| VERIFYING | MODDED | crash recovery: claim expired |
-| MODDED, VERIFIED | PENDING | doctor: required worktree missing (§7 check 2) |
-| VERIFIED | PR_OPEN | branch pushed, review opened; review URL recorded |
-| VERIFIED | VERIFIED | no `review` block configured (rest state) |
-| PR_OPEN | MERGED | review driver reports merged |
-| PR_OPEN | ABANDONED | review driver reports closed without merge |
-| FAILED | PENDING | operator `retry` (attempt counter increments) |
-| any non-terminal | ABANDONED | operator `abandon` (open review closed if any) |
+| **Repository topology** | monorepo vs. many repos | a codemod targets one repository at one base revision |
+| **Version control** | git, svn, fossil, … | isolated workspaces, branch-equivalent publication, empty-change detection, commit-equivalent capture |
+| **State store** | PostgreSQL, sqlite, redis, … | atomic compare-and-swap claiming, durable transitions, the audit log |
+| **Code review** | GitHub, GitLab, Forgejo, Gerrit, sr.ht, … | open (idempotently), poll state (open/merged/declined), close with reason, enumerate orphaned reviews |
+| **Notification** | email, Slack, ticket trackers (Jira/Asana/Linear), … | deliver the per-subtask events; connectors may also drive tickets through their own lifecycle |
+| **Workspace provisioning** | local clones, worktree pools, dev VMs, containers | fresh writable checkout of the base revision, disposable at any time, recreated on demand |
+| **Decomposition** | globs, explicit lists, command output, codeowners maps, build-graph queries | a deterministic-enough list of unique unit strings, re-evaluable to detect drift |
 
-States MUST be persisted before and after each step: a reconciler MUST write
-RUNNING before invoking `run`, and the success state only after the commit
-exists on disk. Every transition MUST be recorded in an append-only event log
-(§6).
+## 7. Operator capabilities
 
-### 5.2 Claims, idempotency, crash recovery
+A conforming implementation MUST offer, by CLI or UI:
 
-Work-in-flight states (RUNNING, VERIFYING) are protected by a **claim**:
-`claimed_by` (an owner identity, e.g. `host:pid`), `claimed_at`, and a lease
-duration (implementation default SHOULD be ≥ the longest expected script
-runtime; the claim is refreshable). A subtask in RUNNING/VERIFYING whose
-claim has expired — or whose owner is provably dead — is **stale**: the
-reconciler or `doctor` MUST recover it by deleting its worktree and resetting
-RUNNING → PENDING, or VERIFYING → MODDED (the commit already exists; only
-verification re-runs).
+- **register** — submit or update a campaign; new units become subtasks,
+  existing subtasks are never disturbed, vanished units are reported (and
+  cleaned up only by an explicit repair, never as a registration side
+  effect).
+- **reconcile** (*sync*) — advance everything advanceable; safe to run at
+  any frequency, from anywhere that reaches the store.
+- **status** — per-subtask states and per-campaign rollups, human- and
+  machine-readable.
+- **doctor** — detect drift between store and reality (stale claims, missing
+  workspaces, vanished units, orphaned reviews, orphaned workspaces);
+  repair only with an explicit flag, logging every repair.
+- **retry** / **abandon** — operator overrides for individual subtasks.
 
-Claiming MUST be safe under concurrency (e.g. `SELECT … FOR UPDATE SKIP
-LOCKED` or an equivalent compare-and-swap), so multiple reconcilers — or a
-future daemon's worker pool — can share one database without double-running a
-subtask.
+## 8. Configuration
 
-All reconciler steps are idempotent from their checkpoint: re-preparing a
-worktree from PENDING discards any half-finished previous attempt; opening a
-review from VERIFIED MUST first check whether a review for the subtask branch
-already exists (crash between "PR created" and "PR_OPEN written") and adopt
-it instead of opening a duplicate.
+A campaign is a declarative document naming the target repository and base
+revision, the decomposition rule, the two scripts, and the review and
+notification policies. The format is an implementation choice (HCL, TOML,
+JSON, …) but MUST support nested structure, string lists, comments, and
+embedded multi-line commands — decomposition-by-command is part of the
+philosophy (bespoke logic in scripts), not an extension. Re-registering an
+updated document updates policy for *future* steps only; history is never
+rewound.
 
-## 6. Database
+## 9. Conformance
 
-Lifecycle state lives in a relational database (the sample uses PostgreSQL;
-any store with atomic compare-and-swap claiming works). Normative schema —
-implementations MAY add columns but MUST preserve these semantics:
+An implementation conforms to this specification if it:
 
-```sql
-CREATE TABLE codemods (
-  id          BIGSERIAL PRIMARY KEY,
-  name        TEXT UNIQUE NOT NULL,
-  config      JSONB NOT NULL,          -- normalized config snapshot
-  config_path TEXT NOT NULL,           -- where it was registered from
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+1. decomposes campaigns into per-unit subtasks and executes the script
+   contract of §5;
+2. provides the lifecycle guarantees of §4 on its chosen store;
+3. exposes the operator capabilities of §7;
+4. isolates the seams of §6 behind replaceable interfaces, including at
+   least one review driver that requires no external service (so the full
+   lifecycle is testable hermetically).
 
-CREATE TABLE subtasks (
-  id         BIGSERIAL PRIMARY KEY,
-  codemod_id BIGINT NOT NULL REFERENCES codemods(id) ON DELETE CASCADE,
-  unit       TEXT NOT NULL,
-  unit_slug  TEXT NOT NULL,
-  state      TEXT NOT NULL DEFAULT 'PENDING',
-  branch     TEXT,                     -- set when worktree is prepared
-  worktree   TEXT,                     -- absolute path, set while one exists
-  pr_url     TEXT,                     -- review identifier/URL
-  attempts   INT NOT NULL DEFAULT 0,
-  last_error TEXT,
-  log_path   TEXT,
-  claimed_by TEXT,
-  claimed_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (codemod_id, unit)
-);
+## 10. Reference implementation
 
-CREATE TABLE events (                  -- append-only audit log
-  id         BIGSERIAL PRIMARY KEY,
-  codemod_id BIGINT REFERENCES codemods(id) ON DELETE CASCADE,
-  subtask_id BIGINT REFERENCES subtasks(id) ON DELETE CASCADE,
-  at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  kind       TEXT NOT NULL,            -- state_change | error | doctor | register
-  from_state TEXT,
-  to_state   TEXT,
-  detail     JSONB
-);
-
-CREATE TABLE notifications (           -- outbound message record
-  id         BIGSERIAL PRIMARY KEY,
-  subtask_id BIGINT REFERENCES subtasks(id) ON DELETE CASCADE,
-  event      TEXT NOT NULL,            -- failed | noop | pr_open | merged | abandoned
-  driver     TEXT NOT NULL,
-  status     TEXT NOT NULL,            -- sent | failed
-  sent_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  detail     JSONB
-);
-```
-
-The `UNIQUE (codemod_id, unit)` constraint is what makes `register`
-idempotent.
-
-## 7. Operator interface (CLI)
-
-A conforming implementation provides these commands. Exit code 0 on success,
-non-zero on any error; commands MUST be safe to interrupt and re-run.
-
-| Command | Behavior |
-|---|---|
-| `codemods init-db` | Create the schema. Idempotent. |
-| `codemods register <config.hcl>` | Parse and validate config; upsert the codemod (config snapshot updated); evaluate decomposition; insert a PENDING subtask per *new* unit, leaving existing subtask rows untouched; report counts of new, existing, and vanished units (§8). |
-| `codemods sync [--codemod NAME] [--limit N]` | The reconciler: claim and advance each eligible subtask — run PENDING ones, verify MODDED ones, open reviews for VERIFIED ones, poll review state for PR_OPEN ones, recover stale claims — then fire notifications for the events produced. One invocation advances each subtask as far as it can get. |
-| `codemods status [--codemod NAME] [--json]` | Per-subtask table: unit, state, attempts, branch, review URL, last error. Plus per-codemod rollup counts. |
-| `codemods doctor [--fix]` | Detect (and with `--fix`, repair) drift; see below. |
-| `codemods retry <codemod> <unit>` | FAILED → PENDING, increment attempts. |
-| `codemods abandon <codemod> <unit>` | Any non-terminal → ABANDONED; close its open review, delete its worktree. |
-
-### Doctor checks
-
-`doctor` MUST detect at least:
-
-1. **Stale claims** — RUNNING/VERIFYING past lease (or dead owner). Fix:
-   recover per §5.2.
-2. **Missing worktrees** — states that require one (MODDED, VERIFIED) whose
-   `worktree` path no longer exists. Fix: reset to PENDING.
-3. **Vanished units** — re-evaluate the decomposition; non-terminal subtasks
-   whose unit no longer exists. Fix: abandon (closing any open review).
-4. **Orphaned reviews** — open reviews on branches under `branch_prefix`
-   with no subtask in PR_OPEN tracking them. Fix: close the review, or adopt
-   it if a VERIFIED subtask matches the branch.
-5. **Orphaned worktrees** — directories under `workdir` not referenced by
-   any non-terminal subtask. Fix: delete.
-
-Without `--fix`, doctor only reports; with it, doctor repairs and logs every
-repair to `events`.
-
-## 8. Re-registration and drift
-
-Decomposition inputs change over time: directories appear, owners are
-re-mapped. Re-running `register` on an updated repo:
-
-- **New units** → new PENDING subtasks.
-- **Existing units** → untouched, whatever their state.
-- **Vanished units** → reported, never auto-abandoned by `register`;
-  `doctor --fix` performs the cleanup (check 3). This split keeps `register`
-  read-mostly and surprise-free.
-
-Config changes on re-register update the stored snapshot and apply to
-*future* steps of all subtasks; steps already taken are not rewound.
-
-## 9. Drivers and hooks
-
-Implementations adapt codemods to their stack by supplying drivers. Required
-interfaces (signatures shown in Python for concreteness; any language works):
-
-```python
-class ReviewDriver(Protocol):
-    def open(self, branch: str, title: str, body: str,
-             reviewers: list[str], draft: bool) -> str: ...
-    """Open a review for the already-pushed `branch`; return its URL/id.
-       (The worktree provider publishes the branch.) MUST be idempotent:
-       if an open review for `branch` already exists, return it."""
-
-    def state(self, pr_url: str) -> Literal["open", "merged", "closed"]: ...
-
-    def close(self, pr_url: str, comment: str) -> None: ...
-
-    def find_orphans(self, branch_prefix: str) -> list[tuple[str, str]]: ...
-    """(branch, pr_url) pairs of open reviews under the prefix."""
-
-class Notifier(Protocol):
-    def send(self, event: str, codemod: str, unit: str,
-             subject: str, body: str) -> None: ...
-
-class Decomposer(Protocol):
-    def units(self, repo_root: Path) -> list[str]: ...
-```
-
-**Notification events** — emitted exactly once per subtask per event, with
-delivery outcome recorded in `notifications`: `failed`, `noop`, `pr_open`,
-`merged`, `abandoned`. The `on` list in the `notify` block selects which are
-delivered. Connectors for chat systems or ticket trackers (Slack, Jira,
-Asana, Linear, …) are Notifiers that react to the same events — e.g. a Jira
-notifier that files a ticket on `failed` and transitions it on `merged`.
-
-**Worktree provider** — the sample clones locally
-(`git clone <repo> <workdir>/<codemod>-<slug>`); an enterprise
-implementation might allocate remote dev machines, container checkouts, or
-sparse/shallow clones of a monorepo. The contract: produce a writable
-checkout of `base_branch` with a fresh branch
-`<branch_prefix>/<codemod>/<slug>` checked out; deletion must be possible at
-any time (the orchestrator recreates on demand).
-
-## 10. Execution modes
-
-**Reconciler CLI (normative).** `sync` is invoked by an operator, cron, or CI
-schedule. Because all state is in the database and every step is
-checkpointed and claim-protected, frequency only affects latency, never
-correctness.
-
-**Daemon (informative, future).** A long-running service with a worker pool
-claiming subtasks concurrently (the claim semantics of §5.2 already permit
-this), a review-state poller or webhook listener, and a notification queue
-drainer. It is the same state machine driven by threads instead of
-invocations; nothing in the schema or transitions changes.
-
-## 11. Sample implementation map
-
-The reference implementation in this repository (Python, `pixi`-managed,
-PostgreSQL, GitHub via `gh`, SMTP email):
-
-| Spec section | Code |
-|---|---|
-| §3 configuration | `src/codemods/config.py` (python-hcl2) |
-| §3.2 decomposers | `src/codemods/decompose.py`, `src/codemods/codeowners.py` |
-| §4 script contract | `src/codemods/runner.py` |
-| §5 state machine | `src/codemods/state.py` |
-| §6 schema | `src/codemods/db.py` |
-| §7 CLI | `src/codemods/cli.py` (click) |
-| §7 doctor | `src/codemods/doctor.py` |
-| §9 review driver | `src/codemods/review/github.py` (`gh` CLI) |
-| §9 notifier | `src/codemods/notify/email.py` (SMTP; demo sink via aiosmtpd) |
-| §9 worktrees | `src/codemods/worktree.py` (local `git clone`) |
-
-An end-to-end public example (clang-tidy over curl's `lib/vauth/*.c` files)
-lives in `examples/clang-tidy-curl/`.
+This repository contains a complete instantiation: Python + pixi,
+PostgreSQL, git worktrees by local clone, GitHub reviews via `gh`, SMTP
+email, HCL configuration, exercised end-to-end against a fork of curl.
+[EXAMPLE_SPEC.md](EXAMPLE_SPEC.md) specifies it prescriptively — exact
+config schema, state machine, SQL schema, driver signatures, CLI — and maps
+each section to the code in `src/codemods/`.

@@ -1,4 +1,4 @@
-"""Database access: schema, registration, claims, transitions (SPEC.md §6)."""
+"""Database access: schema, registration, claims, transitions (EXAMPLE_SPEC.md §6)."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def default_dsn() -> str:
 
 def connect(dsn: str | None = None) -> psycopg.Connection:
     # autocommit so each db.transition() is durable the moment it returns
-    # (SPEC.md §5.1); multi-statement atomicity comes from explicit
+    # (EXAMPLE_SPEC.md §5.1); multi-statement atomicity comes from explicit
     # `with conn.transaction()` blocks, which would otherwise silently become
     # savepoints inside psycopg's implicit transaction.
     return psycopg.connect(dsn or default_dsn(), row_factory=dict_row, autocommit=True)
@@ -102,7 +102,7 @@ def log_event(conn: psycopg.Connection, kind: str, *, codemod_id: int | None = N
 
 def register(conn: psycopg.Connection, config: CodemodConfig, config_path: str,
              units: list[str]) -> dict[str, Any]:
-    """Upsert codemod + insert subtasks for new units (SPEC.md §7, §8).
+    """Upsert codemod + insert subtasks for new units (EXAMPLE_SPEC.md §7, §8).
 
     Returns {"codemod_id", "new", "existing", "vanished"}.
     """

@@ -1,4 +1,4 @@
-"""Notifier interface (SPEC.md §9)."""
+"""Notifier interface (EXAMPLE_SPEC.md §9)."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""GitHub review driver using the `gh` CLI (SPEC.md §9, §11).
+"""GitHub review driver using the `gh` CLI (EXAMPLE_SPEC.md §9, §11).
 
 Requires a logged-in `gh` (run `gh auth login` once).
 """

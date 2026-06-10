@@ -1,4 +1,4 @@
-"""Clone-based worktree provider (SPEC.md §9).
+"""Clone-based worktree provider (EXAMPLE_SPEC.md §9).
 
 Worktrees live at <workdir>/worktrees/<codemod>-<slug>; per-subtask logs at
 <workdir>/logs/<codemod>-<slug>.log.
@@ -34,7 +34,7 @@ def log_path(config: CodemodConfig, slug: str) -> Path:
 
 def prepare(config: CodemodConfig, slug: str) -> Path:
     """Produce a fresh checkout of base_branch with the subtask branch checked
-    out. Any half-finished previous worktree is discarded (SPEC.md §5.2)."""
+    out. Any half-finished previous worktree is discarded (EXAMPLE_SPEC.md §5.2)."""
     path = worktree_path(config, slug)
     discard(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +53,7 @@ def discard(path: Path | str) -> None:
 
 
 def has_changes(path: Path) -> bool:
-    """Any non-ignored modification or untracked file (SPEC.md §4)."""
+    """Any non-ignored modification or untracked file (EXAMPLE_SPEC.md §4)."""
     return bool(_git(path, "status", "--porcelain").strip())
 
 

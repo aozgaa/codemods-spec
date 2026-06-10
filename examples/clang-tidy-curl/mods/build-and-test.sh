@@ -1,5 +1,5 @@
 #!/bin/sh
-# Postmod script (SPEC.md §4): verify the modded file still compiles.
+# Postmod script (EXAMPLE_SPEC.md §4): verify the modded file still compiles.
 # Default: build every object compiled from the modded TU (brace fixes are
 # strictly local, so that covers the change). CODEMODS_FULL_TESTS=1 builds
 # the whole tree instead; curl's runtests.pl harness is deliberately not run

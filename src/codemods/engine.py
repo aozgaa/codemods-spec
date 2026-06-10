@@ -1,4 +1,4 @@
-"""The reconciler engine (SPEC.md §5, §7).
+"""The reconciler engine (EXAMPLE_SPEC.md §5, §7).
 
 All orchestration logic lives here, behind injectable drivers: pass
 `review_driver` / `notifier` to use fakes (tests, dry runs); leave them None
@@ -20,7 +20,7 @@ from .notify.base import Notifier, NotifyError, get_notifier
 from .review.base import ReviewDriver, get_review_driver
 from .runner import run_script
 
-# State -> notification event it implies (SPEC.md §9).
+# State -> notification event it implies (EXAMPLE_SPEC.md §9).
 EVENT_OF_STATE = {
     st.FAILED: "failed",
     st.NOOP: "noop",
@@ -63,7 +63,7 @@ class Engine:
             return self._notifier
         return get_notifier(cfg.notify.driver) if cfg.notify else None
 
-    # -- register (SPEC.md §7, §8) -----------------------------------------
+    # -- register (EXAMPLE_SPEC.md §7, §8) -----------------------------------------
 
     def register(self, config_path: str | Path) -> dict:
         cfg = load_config(config_path)
@@ -72,7 +72,7 @@ class Engine:
             "name": cfg.name, "units": len(units),
         }
 
-    # -- sync: the reconciler (SPEC.md §7) ----------------------------------
+    # -- sync: the reconciler (EXAMPLE_SPEC.md §7) ----------------------------------
 
     def sync(self, codemod_name: str | None = None, limit: int | None = None) -> list[Outcome]:
         outcomes = self.recover_stale()
@@ -208,7 +208,7 @@ class Engine:
             msg += f"\n\n{cfg.description}"
         return msg
 
-    # -- notifications (SPEC.md §9): derived from state, deduped ------------
+    # -- notifications (EXAMPLE_SPEC.md §9): derived from state, deduped ------------
 
     def _notify_pass(self, cm: dict, cfg: CodemodConfig) -> list[Outcome]:
         notifier = self.notifier(cfg)
@@ -241,7 +241,7 @@ class Engine:
                                         f"notification {event} failed: {e}"))
         return outcomes
 
-    # -- crash recovery (SPEC.md §5.2) ---------------------------------------
+    # -- crash recovery (EXAMPLE_SPEC.md §5.2) ---------------------------------------
 
     def recover_stale(self) -> list[Outcome]:
         outcomes = []
@@ -255,7 +255,7 @@ class Engine:
                                         f"stale claim recovered -> {target}"))
         return outcomes
 
-    # -- operator commands (SPEC.md §7) --------------------------------------
+    # -- operator commands (EXAMPLE_SPEC.md §7) --------------------------------------
 
     def retry(self, codemod_name: str, unit: str) -> Outcome:
         cm, sub = self._find(codemod_name, unit)
@@ -286,7 +286,7 @@ class Engine:
             raise LookupError(f"codemod {codemod_name!r} has no unit {unit!r}")
         return cm, sub
 
-    # -- doctor (SPEC.md §7) --------------------------------------------------
+    # -- doctor (EXAMPLE_SPEC.md §7) --------------------------------------------------
 
     def doctor(self, fix: bool = False, codemod_name: str | None = None) -> list[Outcome]:
         findings: list[Outcome] = []

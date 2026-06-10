@@ -5,9 +5,12 @@ small, per-unit changes that are run, verified, and code-reviewed
 independently — so a 100-reviewer mega-PR becomes N reviewable ones, tracked
 end-to-end in a database.
 
-- **[SPEC.md](SPEC.md)** — the specification: config format, state machine,
-  database schema, driver contracts. Implement its drivers against your own
-  SDLC stack.
+- **[SPEC.md](SPEC.md)** — the general specification: philosophy,
+  architecture, lifecycle guarantees, and the adaptation points along which
+  enterprise stacks differ. Implementation-agnostic.
+- **[EXAMPLE_SPEC.md](EXAMPLE_SPEC.md)** — the prescriptive spec of the
+  reference implementation: HCL config schema, exact state machine, SQL
+  schema, driver signatures, CLI. One concrete instantiation of SPEC.md.
 - **`src/codemods/`** — the reference implementation: Python, PostgreSQL,
   git worktrees by local clone, GitHub reviews via `gh`, email notification
   via SMTP. All orchestration lives in `engine.py` behind injectable driver
@@ -29,7 +32,7 @@ pixi run db-start          # postgres on localhost:5499
 pixi run smtp-sink &       # demo mail sink on localhost:8025 -> .mail/
 pixi run codemods init-db
 
-git clone git@github.com:aozgaa/curl.git ../curl
+examples/clang-tidy-curl/scripts/init-fork.sh   # fork curl + clone to ../curl
 pixi run codemods register examples/clang-tidy-curl/curl-fake.hcl
 pixi run codemods sync --codemod curl-tidy-braces-fake  # run + verify + fake reviews
 pixi run codemods status --codemod curl-tidy-braces-fake
@@ -73,4 +76,5 @@ driver, and a recording notifier; no GitHub or SMTP needed.
    decomposition types are `literal`, `glob`, `command`, `codeowners`).
 4. `codemods register your.hcl && codemods sync`.
 
-See [SPEC.md](SPEC.md) for the full contract.
+See [EXAMPLE_SPEC.md](EXAMPLE_SPEC.md) for the full contract, and
+[SPEC.md](SPEC.md) for the philosophy behind it.

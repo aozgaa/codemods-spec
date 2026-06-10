@@ -1,4 +1,4 @@
-"""Execute run/postmod scripts under the script contract (SPEC.md §4)."""
+"""Execute run/postmod scripts under the script contract (EXAMPLE_SPEC.md §4)."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Operator CLI (SPEC.md §7) — a thin presentation layer over engine.Engine."""
+"""Operator CLI (EXAMPLE_SPEC.md §7) — a thin presentation layer over engine.Engine."""
 
 from __future__ import annotations
 
