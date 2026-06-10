@@ -9,6 +9,7 @@ from codemods.decompose import DecompositionError, decompose, unit_files
 def make_config(repo, **dkwargs):
     return CodemodConfig(
         name="t",
+        author="dev@example.com",
         repo=str(repo),
         base_branch="main",
         run="/bin/true",

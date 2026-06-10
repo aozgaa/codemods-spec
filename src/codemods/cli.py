@@ -50,14 +50,18 @@ def init_db(ctx):
 
 @main.command()
 @click.argument("config_path", type=click.Path(exists=True))
+@click.option("--test", "test", is_flag=True,
+              help="Register into the testing stage (draft/test reviews, "
+                   "author-only notifications; see EXAMPLE_SPEC.md §3.4).")
 @click.pass_context
-def register(ctx, config_path):
+def register(ctx, config_path, test):
     """Register a codemod config and decompose it into subtasks."""
     engine, conn = _engine(ctx)
     with conn:
-        r = engine.register(config_path)
+        r = engine.register(config_path, test=test)
     click.echo(f"codemod {r['name']!r}: {r['units']} units "
-               f"({len(r['new'])} new, {r['existing']} existing)")
+               f"({len(r['new'])} new, {r['existing']} existing)"
+               + (" [test stage]" if test else ""))
     for u in r["new"]:
         click.echo(f"  + {u}")
     for u in r["vanished"]:
@@ -86,6 +90,7 @@ def status(ctx, name, as_json):
         if name and cm is None:
             raise click.ClickException(f"no codemod named {name!r}")
         rows = db.list_subtasks(conn, cm["id"] if cm else None)
+        meta = {c["name"]: c for c in db.list_codemods(conn)}
     if as_json:
         click.echo(json.dumps(
             [{k: str(v) if k.endswith("_at") else v for k, v in r.items()}
@@ -110,7 +115,12 @@ def status(ctx, name, as_json):
         rollup[r["codemod_name"]][r["state"]] += 1
     for cm_name, counts in sorted(rollup.items()):
         summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-        click.echo(f"-- {cm_name}: {summary}")
+        c = meta[cm_name]
+        line = (f"-- {cm_name} [{c['stage']}, {c['status']}, "
+                f"author={c['author']}]: {summary}")
+        if c["status_reason"]:
+            line += f" ({c['status_reason']})"
+        click.echo(line)
 
 
 @main.command()
@@ -125,6 +135,73 @@ def doctor(ctx, name, fix):
     _print(findings)
     if findings and not fix:
         sys.exit(1)
+
+
+@main.command()
+@click.argument("codemod_name")
+@click.option("--reason", default=None, help="Recorded as the pause reason.")
+@click.pass_context
+def pause(ctx, codemod_name, reason):
+    """Pause a codemod: sync stops advancing its subtasks."""
+    engine, conn = _engine(ctx)
+    with conn:
+        click.echo(str(_run(engine.pause, codemod_name, reason)))
+
+
+@main.command()
+@click.argument("codemod_name")
+@click.pass_context
+def resume(ctx, codemod_name):
+    """Resume a paused codemod (including auto-paused ones)."""
+    engine, conn = _engine(ctx)
+    with conn:
+        click.echo(str(_run(engine.resume, codemod_name)))
+
+
+@main.command()
+@click.argument("codemod_name")
+@click.pass_context
+def cancel(ctx, codemod_name):
+    """Cancel a codemod: abandon all its subtasks and close their reviews."""
+    engine, conn = _engine(ctx)
+    with conn:
+        _print(_run(engine.cancel, codemod_name))
+
+
+@main.command()
+@click.argument("codemod_name")
+@click.pass_context
+def promote(ctx, codemod_name):
+    """Promote a test-stage codemod to production (fresh generation)."""
+    engine, conn = _engine(ctx)
+    with conn:
+        r = _run(engine.promote, codemod_name)
+    click.echo(f"codemod {r['name']!r} promoted to production: "
+               f"abandoned {r['abandoned']} test subtasks, "
+               f"generation {r['generation']} with {r['units']} units")
+
+
+@main.command()
+@click.option("--interval", type=int, default=30, show_default=True,
+              help="Seconds between sync passes.")
+@click.option("--codemod", "name", default=None, help="Only this codemod.")
+@click.pass_context
+def daemon(ctx, interval, name):
+    """Run sync in a loop until SIGINT/SIGTERM (same engine as the CLI)."""
+    import signal
+    import threading
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    engine, conn = _engine(ctx)
+    click.echo(f"codemods daemon: syncing every {interval}s (ctrl-c to stop)")
+    with conn:
+        while not stop.is_set():
+            for o in _run(engine.sync, name):
+                click.echo(str(o))
+            stop.wait(interval)
+    click.echo("daemon stopped")
 
 
 @main.command()

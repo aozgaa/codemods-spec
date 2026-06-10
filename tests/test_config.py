@@ -4,6 +4,7 @@ from codemods.config import CodemodConfig, ConfigError, load_config, slugify
 
 MINIMAL = """
 codemod "demo" {{
+  author      = "dev@example.com"
   repo        = "{repo}"
   base_branch = "main"
   run         = "./run.sh"
@@ -83,8 +84,11 @@ def test_invalid_configs_rejected(tmp_path, mutation, match):
 
 def test_missing_required_key(tmp_path):
     p = tmp_path / "bad.hcl"
-    p.write_text('codemod "x" {\n  repo = "/tmp/r"\n  base_branch = "main"\n}\n')
+    p.write_text('codemod "x" {\n  author = "a@b.c"\n  repo = "/tmp/r"\n  base_branch = "main"\n}\n')
     with pytest.raises(ConfigError, match="missing required key 'run'"):
+        load_config(p)
+    p.write_text('codemod "x" {\n  repo = "/tmp/r"\n  base_branch = "main"\n  run = "./r.sh"\n}\n')
+    with pytest.raises(ConfigError, match="missing required key 'author'"):
         load_config(p)
 
 

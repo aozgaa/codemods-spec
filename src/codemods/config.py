@@ -51,8 +51,24 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class Limits:
+    max_open_reviews: int = 0  # 0 = unlimited (SPEC.md §4.2)
+    max_failures: int = 0      # 0 = never auto-pause
+
+
+@dataclass(frozen=True)
+class TestOverrides:
+    """Testing-stage overrides (EXAMPLE_SPEC.md §3.4)."""
+
+    review: ReviewConfig | None = None
+    notify: NotifyConfig | None = None
+    sample: int = 0  # 0 = all units
+
+
+@dataclass(frozen=True)
 class CodemodConfig:
     name: str
+    author: str
     repo: str
     base_branch: str
     run: str
@@ -63,6 +79,8 @@ class CodemodConfig:
     postmod: str = ""
     review: ReviewConfig | None = None
     notify: NotifyConfig | None = None
+    limits: Limits = field(default_factory=Limits)
+    test: TestOverrides | None = None
 
     def branch_for(self, slug: str) -> str:
         return f"{self.branch_prefix}/{self.name}/{slug}"
@@ -73,12 +91,47 @@ class CodemodConfig:
     @staticmethod
     def from_dict(d: dict) -> "CodemodConfig":
         d = dict(d)
+        d.setdefault("author", "")  # config snapshots predating the author field
         d["decomposition"] = Decomposition(**d["decomposition"])
         if d.get("review"):
             d["review"] = ReviewConfig(**d["review"])
         if d.get("notify"):
             d["notify"] = NotifyConfig(**d["notify"])
+        d["limits"] = Limits(**d.get("limits") or {})
+        if d.get("test"):
+            t = dict(d["test"])
+            if t.get("review"):
+                t["review"] = ReviewConfig(**t["review"])
+            if t.get("notify"):
+                t["notify"] = NotifyConfig(**t["notify"])
+            d["test"] = TestOverrides(**t)
         return CodemodConfig(**d)
+
+
+def for_stage(cfg: CodemodConfig, stage: str) -> CodemodConfig:
+    """Effective config for a codemod's stage (EXAMPLE_SPEC.md §3.4).
+
+    In the test stage, reviews never request owner attention and
+    notifications reach only the author; the stored config is untouched.
+    """
+    if stage != "test":
+        return cfg
+    t = cfg.test or TestOverrides()
+    review = t.review
+    if review is None and cfg.review is not None:
+        review = dataclasses.replace(cfg.review, draft=True,
+                                     title=f"[test] {cfg.review.title}")
+    notify = t.notify
+    if notify is None and cfg.notify is not None:
+        notify = dataclasses.replace(cfg.notify, to=[cfg.author])
+    return dataclasses.replace(cfg, review=review, notify=notify)
+
+
+def sample_units(cfg: CodemodConfig, stage: str, units: list[str]) -> list[str]:
+    """Apply the test-stage decomposition sample (EXAMPLE_SPEC.md §3.4)."""
+    if stage == "test" and cfg.test and cfg.test.sample > 0:
+        return units[: cfg.test.sample]
+    return units
 
 
 def _single_block(raw: dict, key: str, where: str) -> dict | None:
@@ -123,6 +176,36 @@ def _parse_decomposition(raw: dict, where: str) -> Decomposition:
     return d
 
 
+def _parse_review(rraw: dict, where: str) -> ReviewConfig:
+    if not rraw.get("driver"):
+        raise ConfigError(f"{where}: review block requires 'driver'")
+    return ReviewConfig(
+        driver=rraw["driver"],
+        repo=rraw.get("repo", ""),
+        push_url=rraw.get("push_url", ""),
+        title=rraw.get("title", ReviewConfig.title),
+        body=rraw.get("body", ReviewConfig.body),
+        reviewers=list(rraw.get("reviewers", [])),
+        draft=bool(rraw.get("draft", False)),
+    )
+
+
+def _parse_notify(nraw: dict, where: str) -> NotifyConfig:
+    if not nraw.get("driver"):
+        raise ConfigError(f"{where}: notify block requires 'driver'")
+    on = list(nraw.get("on", ["failed", "pr_open", "merged", "abandoned"]))
+    bad = set(on) - NOTIFY_EVENTS
+    if bad:
+        raise ConfigError(f"{where}: unknown notify events {sorted(bad)}")
+    return NotifyConfig(
+        driver=nraw["driver"],
+        to=list(nraw.get("to", [])),
+        sender=nraw.get("from", NotifyConfig.sender),
+        smtp=nraw.get("smtp", NotifyConfig.smtp),
+        on=on,
+    )
+
+
 def load_config(path: str | Path) -> CodemodConfig:
     """Load a single-codemod HCL file into a validated CodemodConfig."""
     path = Path(path).resolve()
@@ -142,7 +225,7 @@ def load_config(path: str | Path) -> CodemodConfig:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
         raise ConfigError(f"{path}: invalid codemod name {name!r}")
 
-    for key in ("repo", "base_branch", "run"):
+    for key in ("author", "repo", "base_branch", "run"):
         if not body.get(key):
             raise ConfigError(f"{path}: codemod {name!r} missing required key '{key}'")
 
@@ -155,36 +238,40 @@ def load_config(path: str | Path) -> CodemodConfig:
 
     review = None
     if (rraw := _single_block(body, "review", str(path))) is not None:
-        if not rraw.get("driver"):
-            raise ConfigError(f"{path}: review block requires 'driver'")
-        review = ReviewConfig(
-            driver=rraw["driver"],
-            repo=rraw.get("repo", ""),
-            push_url=rraw.get("push_url", ""),
-            title=rraw.get("title", ReviewConfig.title),
-            body=rraw.get("body", ReviewConfig.body),
-            reviewers=list(rraw.get("reviewers", [])),
-            draft=bool(rraw.get("draft", False)),
-        )
+        review = _parse_review(rraw, str(path))
+        if review.driver == "fake" and review.repo:
+            # The fake driver's `repo` is a state-file path, not an SCM repo.
+            review = dataclasses.replace(review, repo=_resolve(base, review.repo))
 
     notify = None
     if (nraw := _single_block(body, "notify", str(path))) is not None:
-        if not nraw.get("driver"):
-            raise ConfigError(f"{path}: notify block requires 'driver'")
-        on = list(nraw.get("on", ["failed", "pr_open", "merged", "abandoned"]))
-        bad = set(on) - NOTIFY_EVENTS
-        if bad:
-            raise ConfigError(f"{path}: unknown notify events {sorted(bad)}")
-        notify = NotifyConfig(
-            driver=nraw["driver"],
-            to=list(nraw.get("to", [])),
-            sender=nraw.get("from", NotifyConfig.sender),
-            smtp=nraw.get("smtp", NotifyConfig.smtp),
-            on=on,
+        notify = _parse_notify(nraw, str(path))
+
+    limits = Limits()
+    if (lraw := _single_block(body, "limits", str(path))) is not None:
+        limits = Limits(
+            max_open_reviews=int(lraw.get("max_open_reviews", 0)),
+            max_failures=int(lraw.get("max_failures", 0)),
         )
+
+    test = None
+    if (traw := _single_block(body, "test", str(path))) is not None:
+        t_review = _single_block(traw, "review", f"{path} (test block)")
+        t_notify = _single_block(traw, "notify", f"{path} (test block)")
+        test = TestOverrides(
+            review=_parse_review(t_review, f"{path} (test block)") if t_review else None,
+            notify=_parse_notify(t_notify, f"{path} (test block)") if t_notify else None,
+            sample=int(traw.get("sample", 0)),
+        )
+        if test.review and test.review.driver == "fake" and test.review.repo:
+            # The fake driver's `repo` is a state-file path, not an SCM repo.
+            test = dataclasses.replace(
+                test, review=dataclasses.replace(
+                    test.review, repo=_resolve(base, test.review.repo)))
 
     return CodemodConfig(
         name=name,
+        author=body["author"],
         description=body.get("description", ""),
         repo=_resolve(base, body["repo"]),
         base_branch=body["base_branch"],
@@ -195,6 +282,8 @@ def load_config(path: str | Path) -> CodemodConfig:
         decomposition=decomposition,
         review=review,
         notify=notify,
+        limits=limits,
+        test=test,
     )
 
 

@@ -21,7 +21,7 @@ document records what this implementation chose:
 | Workspace provisioning | local `git clone` per subtask |
 | Decomposition | `literal`, `glob`, `command`, `codeowners` |
 | Configuration format | HCL |
-| Execution mode | reconciler CLI |
+| Execution modes | reconciler CLI + `codemods daemon` loop, both over one shared engine |
 
 When implementing your own system, read SPEC.md for the requirements and
 use this document and the accompanying code as a worked example — the state
@@ -61,6 +61,10 @@ SPEC.md §8).
 ```hcl
 codemod "clang-tidy-fix" {
   description = "Apply clang-tidy fixes, one src subdirectory at a time"
+
+  # Campaign author: receives failure/auto-pause notifications and all
+  # testing-stage notifications (SPEC.md §4.2, §7).
+  author = "author@example.com"
 
   # Where worktrees are cloned from. Local path or URL, anything the
   # implementation's SCM tooling can clone.
@@ -106,13 +110,29 @@ codemod "clang-tidy-fix" {
     smtp   = "localhost:8025"        # driver-specific
     on     = ["failed", "pr_open", "merged", "abandoned"]
   }
+
+  # Campaign limits (SPEC.md §4.2). Both default to 0 = unlimited.
+  limits {
+    max_open_reviews = 5    # hold further reviews until earlier ones land
+    max_failures     = 3    # auto-pause the codemod at this many FAILED subtasks
+  }
+
+  # Testing-stage overrides (SPEC.md §7). All optional; see §3.4.
+  test {
+    sample = 2              # decompose only the first N units
+    review {                # replaces the production review block in test stage
+      driver = "fake"
+      repo   = "./work/test-prs.json"
+    }
+  }
 }
 ```
 
-Top-level keys `repo`, `base_branch`, `run`, and one `decomposition` block are
-REQUIRED. `branch_prefix` defaults to `codemods`; `workdir` defaults to
-`./work`; `postmod`, `review`, and `notify` are OPTIONAL (a codemod without a
-`review` block stops at VERIFIED — useful for dry runs).
+Top-level keys `author`, `repo`, `base_branch`, `run`, and one
+`decomposition` block are REQUIRED. `branch_prefix` defaults to `codemods`;
+`workdir` defaults to `./work`; `postmod`, `review`, `notify`, `limits`,
+and `test` are OPTIONAL (a codemod without a `review` block stops at
+VERIFIED — useful for dry runs).
 
 Relative paths (`run`, `postmod`, `workdir`, codeowners `path`) resolve
 against the directory containing the config file.
@@ -185,6 +205,26 @@ lowercased, with every character outside `[a-z0-9._-]` replaced by `-`,
 collapsed runs of `-`, trimmed to 60 characters. If two units in one codemod
 slug identically, a numeric suffix (`-2`, `-3`, …) disambiguates
 deterministically by registration order.
+
+### 3.4 Testing-stage overrides
+
+`codemods register --test` registers a codemod in the **test** stage
+(SPEC.md §7, authorship workflow). In the test stage the effective
+configuration is derived from the production configuration as follows:
+
+- **review** — replaced by `test.review` if present; otherwise the
+  production review block is used with `draft` forced to `true` and the
+  title prefixed `[test]`. Reviews therefore never request owner
+  attention.
+- **notify** — replaced by `test.notify` if present; otherwise the
+  production notify block is used with `to` replaced by `[author]`.
+  Without a production notify block, no notifications are sent.
+- **sample** — when `test.sample = N` is set, decomposition keeps only the
+  first N units.
+
+The production blocks are untouched in the stored config; the overrides
+apply only while the codemod is in the test stage. `codemods promote`
+switches the codemod to the production stage (§5.3).
 
 ## 4. Script contract
 
@@ -284,6 +324,31 @@ review from VERIFIED MUST first check whether a review for the subtask branch
 already exists (crash between "PR created" and "PR_OPEN written") and adopt
 it instead of opening a duplicate.
 
+### 5.3 Codemod lifecycle
+
+The codemod row itself carries (SPEC.md §4.2):
+
+- **status** — `active` | `paused` | `cancelled`. The reconciler only
+  advances subtasks of `active` codemods. `pause` freezes; `resume`
+  reactivates; `cancel` abandons every non-terminal subtask (closing open
+  reviews) and is terminal. When the number of FAILED subtasks in the
+  current generation reaches `limits.max_failures`, the reconciler sets
+  `status = paused` with a recorded reason and notifies the author
+  (`event = paused`, no subtask).
+- **stage** — `test` | `production`. Set to `test` by `register --test`,
+  to `production` by `register` or `promote`.
+- **generation** — an integer, incremented by `promote`. Subtasks carry the
+  generation they were created in; the reconciler, status rollups, and
+  doctor operate on the current generation. `promote` abandons all
+  non-terminal current-generation subtasks (closing their reviews),
+  increments the generation, switches stage to `production`, and
+  re-decomposes into fresh PENDING subtasks. Old-generation rows are
+  retained for audit.
+
+Review throttling: a subtask in VERIFIED does not move to PR_OPEN while
+`limits.max_open_reviews > 0` and the codemod already has that many
+current-generation subtasks in PR_OPEN.
+
 ## 6. Database
 
 Lifecycle state lives in PostgreSQL (per SPEC.md §6, any store with atomic
@@ -292,17 +357,23 @@ columns but MUST preserve these semantics:
 
 ```sql
 CREATE TABLE codemods (
-  id          BIGSERIAL PRIMARY KEY,
-  name        TEXT UNIQUE NOT NULL,
-  config      JSONB NOT NULL,          -- normalized config snapshot
-  config_path TEXT NOT NULL,           -- where it was registered from
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  id            BIGSERIAL PRIMARY KEY,
+  name          TEXT UNIQUE NOT NULL,
+  author        TEXT NOT NULL,
+  config        JSONB NOT NULL,        -- normalized config snapshot
+  config_path   TEXT NOT NULL,         -- where it was registered from
+  status        TEXT NOT NULL DEFAULT 'active',  -- active | paused | cancelled
+  status_reason TEXT,                  -- why paused/cancelled (e.g. auto-pause)
+  stage         TEXT NOT NULL DEFAULT 'production',  -- test | production
+  generation    INT NOT NULL DEFAULT 1,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE subtasks (
   id         BIGSERIAL PRIMARY KEY,
   codemod_id BIGINT NOT NULL REFERENCES codemods(id) ON DELETE CASCADE,
+  generation INT NOT NULL DEFAULT 1,   -- matches codemods.generation at creation
   unit       TEXT NOT NULL,
   unit_slug  TEXT NOT NULL,
   state      TEXT NOT NULL DEFAULT 'PENDING',
@@ -316,7 +387,7 @@ CREATE TABLE subtasks (
   claimed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (codemod_id, unit)
+  UNIQUE (codemod_id, generation, unit)
 );
 
 CREATE TABLE events (                  -- append-only audit log
@@ -341,8 +412,9 @@ CREATE TABLE notifications (           -- outbound message record
 );
 ```
 
-The `UNIQUE (codemod_id, unit)` constraint is what makes `register`
-idempotent.
+The `UNIQUE (codemod_id, generation, unit)` constraint is what makes
+`register` idempotent within a generation. `notifications.subtask_id` is
+nullable: codemod-level events (auto-pause) are recorded without one.
 
 ## 7. Operator interface (CLI)
 
@@ -352,9 +424,14 @@ non-zero on any error; commands MUST be safe to interrupt and re-run.
 | Command | Behavior |
 |---|---|
 | `codemods init-db` | Create the schema. Idempotent. |
-| `codemods register <config.hcl>` | Parse and validate config; upsert the codemod (config snapshot updated); evaluate decomposition; insert a PENDING subtask per *new* unit, leaving existing subtask rows untouched; report counts of new, existing, and vanished units (§8). |
-| `codemods sync [--codemod NAME] [--limit N]` | The reconciler: claim and advance each eligible subtask — run PENDING ones, verify MODDED ones, open reviews for VERIFIED ones, poll review state for PR_OPEN ones, recover stale claims — then fire notifications for the events produced. One invocation advances each subtask as far as it can get. |
-| `codemods status [--codemod NAME] [--json]` | Per-subtask table: unit, state, attempts, branch, review URL, last error. Plus per-codemod rollup counts. |
+| `codemods register [--test] <config.hcl>` | Parse and validate config; upsert the codemod (config snapshot updated); evaluate decomposition (with test-stage overrides under `--test`, §3.4); insert a PENDING subtask per *new* unit in the current generation, leaving existing subtask rows untouched; report counts of new, existing, and vanished units (§8). |
+| `codemods sync [--codemod NAME] [--limit N]` | The reconciler: for each *active* codemod, claim and advance each eligible current-generation subtask — run PENDING ones, verify MODDED ones, open reviews for VERIFIED ones (subject to `max_open_reviews`), poll review state for PR_OPEN ones, recover stale claims — then fire notifications and apply auto-pause (§5.3). One invocation advances each subtask as far as it can get. |
+| `codemods status [--codemod NAME] [--json]` | Per-subtask table: unit, state, attempts, branch, review URL, last error. Plus per-codemod rollups with author, stage, and status. |
+| `codemods pause <codemod> [--reason R]` | status → paused; sync skips the codemod. |
+| `codemods resume <codemod>` | paused → active (also clears an auto-pause). |
+| `codemods cancel <codemod>` | Abandon all non-terminal subtasks (closing reviews); status → cancelled (terminal). |
+| `codemods promote <codemod>` | Test stage → production: abandon current-generation subtasks, increment generation, re-decompose (§5.3). |
+| `codemods daemon [--interval SECONDS] [--codemod NAME]` | Run `sync` in a loop until SIGINT/SIGTERM. Same engine as the CLI commands (SPEC.md §7, execution modes). |
 | `codemods doctor [--fix]` | Detect (and with `--fix`, repair) drift; see below. |
 | `codemods retry <codemod> <unit>` | FAILED → PENDING, increment attempts. |
 | `codemods abandon <codemod> <unit>` | Any non-terminal → ABANDONED; close its open review, delete its worktree. |
@@ -443,16 +520,21 @@ any time (the orchestrator recreates on demand).
 
 ## 10. Execution modes
 
-**Reconciler CLI (normative).** `sync` is invoked by an operator, cron, or CI
-schedule. Because all state is in the database and every step is
-checkpointed and claim-protected, frequency only affects latency, never
-correctness.
+All business logic lives in one engine (`engine.Engine`); the execution
+modes are thin shells over it.
 
-**Daemon (informative, future).** A long-running service with a worker pool
-claiming subtasks concurrently (the claim semantics of §5.2 already permit
-this), a review-state poller or webhook listener, and a notification queue
-drainer. It is the same state machine driven by threads instead of
-invocations; nothing in the schema or transitions changes.
+**Reconciler CLI.** `sync` is invoked by an operator, cron, or CI schedule.
+Because all state is in the database and every step is checkpointed and
+claim-protected, frequency only affects latency, never correctness.
+
+**Daemon.** `codemods daemon` repeats `sync` on an interval until
+SIGINT/SIGTERM, exiting cleanly at a pass boundary. Multiple daemons (or a
+daemon plus ad-hoc CLI syncs) may share one database; the claim semantics
+of §5.2 prevent double-running.
+
+**Future: concurrent workers.** A worker pool claiming subtasks in parallel
+requires no schema or transition changes — only a threaded shell around the
+same engine.
 
 ## 11. Implementation map
 

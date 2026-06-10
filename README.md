@@ -57,17 +57,38 @@ curl fork (and `scripts/clean-fork.sh` to close them afterwards).
 `sync` is a reconciler: every invocation advances each subtask as far as it
 can (run script → commit → postmod → push → open PR → poll review state) and
 is safe to kill and re-run at any point. Repeated runs carry every subtask
-to MERGED / NOOP / ABANDONED.
+to MERGED / NOOP / ABANDONED. `codemods daemon --interval 30` is the same
+engine in a loop — the service form of the demo.
+
+### Authorship flow
+
+A new codemod is tested before it can interrupt code owners (SPEC.md §7):
+
+```sh
+pixi run codemods register --test examples/clang-tidy-curl/curl.hcl
+pixi run codemods sync --codemod curl-tidy-braces
+# test stage: 2 sampled units, reviews in a local fake file, notifications
+# to the author only. Inspect diffs/logs, fix the scripts, re-test…
+pixi run codemods promote curl-tidy-braces
+pixi run codemods sync --codemod curl-tidy-braces   # now the real campaign
+```
 
 Operator commands (SPEC.md §7, as realized by the demo):
 
 ```sh
 pixi run codemods status --json        # machine-readable
+pixi run codemods pause  <codemod> --reason "spamming reviewers"
+pixi run codemods resume <codemod>     # also clears an auto-pause
+pixi run codemods cancel <codemod>     # abandon everything, close reviews
 pixi run codemods doctor               # report drift (stale claims, orphans…)
 pixi run codemods doctor --fix         # repair it
 pixi run codemods retry  <codemod> <unit>
 pixi run codemods abandon <codemod> <unit>
 ```
+
+Campaigns declare safety rails in their config — `limits { max_open_reviews
+= 4, max_failures = 3 }` keeps a runaway codemod from flooding reviewers
+and auto-pauses it (notifying its author) when failures pile up.
 
 To point the demo at a different repository or transformation: write a run
 script (argv[1] = unit, exit 0 on success; empty diff ⇒ NOOP), optionally a

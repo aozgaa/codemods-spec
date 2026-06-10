@@ -75,11 +75,18 @@ The system MUST expose its state for inspection, keep an append-only audit
 log, and provide a *doctor* facility that detects drift and repairs it only
 on explicit request.
 
+**Campaigns are owned, managed objects.** Run as a service, the system
+hosts many concurrent campaigns written by many authors; some will fail
+repeatedly, some will open more reviews than the organization can absorb.
+Every campaign therefore records an author, can be paused, resumed, and
+cancelled as a whole, is subject to rate limits on open reviews, and can be
+exercised in a testing stage that cannot interrupt code owners (§4.2, §7).
+
 ## 3. Components
 
 | Component | Role |
 |---|---|
-| **Codemod** | A registered change campaign: configuration + a *run* script + an optional *postmod* script + a decomposition rule. |
+| **Codemod** | A registered change campaign: configuration + a *run* script + an optional *postmod* script + a decomposition rule. Carries an author, a stage (testing or production), and an operational status (active, paused, cancelled). |
 | **Unit** | One item produced by decomposition (a path, a target, an owner). Identified by its literal string value, unique within its codemod. |
 | **Subtask** | The durable lifecycle record of one unit within one codemod: state, workspace and review references, attempt count, logs, claim metadata. |
 | **Workspace** | An isolated, writable checkout of the target repository in which one subtask's scripts execute (a git clone or worktree, a container, a dev VM). |
@@ -106,6 +113,8 @@ Implementations choose their own state names and storage (EXAMPLE_SPEC.md
 §5 and §6 give a worked state machine and schema). Whatever the
 representation:
 
+### 4.1 Subtask lifecycle
+
 - **Durability.** Entering and leaving a work-in-flight phase MUST be
   persisted: the store records that a script is about to run before it
   runs, and records the outcome only once its effects (e.g. a commit)
@@ -126,6 +135,31 @@ representation:
   outcome recorded; failed deliveries are retried on later reconciliations.
 - **Audit.** Every state change, repair, and notification is recorded in an
   append-only event log.
+
+### 4.2 Campaign lifecycle
+
+The campaign (codemod) itself has durable state, distinct from its
+subtasks:
+
+- **Status.** A campaign is *active*, *paused*, or *cancelled*. The
+  reconciler advances subtasks only for active campaigns; pausing freezes a
+  campaign wherever it stands (no new claims, no new reviews, no review
+  polling) without losing state, and resuming continues from there.
+  Cancelling is terminal: every non-terminal subtask is abandoned and its
+  open review closed.
+- **Review throttling.** A campaign MAY declare a maximum number of
+  concurrently open reviews; the reconciler MUST NOT open reviews beyond
+  it. Further units progress as earlier reviews merge or close. This bounds
+  the blast radius of a campaign that would otherwise flood reviewers.
+- **Failure containment.** A campaign MAY declare a failure threshold; when
+  the number of failed subtasks reaches it, the system MUST pause the
+  campaign automatically, record why, and notify the author. A bad script
+  stops itself instead of failing through the whole repository.
+- **Stage.** A campaign is in the *testing* stage or the *production*
+  stage. The testing stage exists so an author can exercise a campaign
+  end-to-end without interrupting code owners (§7, authorship workflow);
+  promotion to production discards testing artifacts and starts the
+  production campaign cleanly.
 
 ## 5. Script contract
 
@@ -167,26 +201,66 @@ concrete signatures.
 
 An implementation MUST offer, by CLI or UI:
 
-- **register** — submit or update a campaign. New units become subtasks;
-  existing subtasks are never disturbed; vanished units are reported and
-  cleaned up only by an explicit repair, never as a registration side
-  effect.
+- **register** — submit or update a campaign (into the testing stage when
+  requested). New units become subtasks; existing subtasks are never
+  disturbed; vanished units are reported and cleaned up only by an explicit
+  repair, never as a registration side effect.
 - **reconcile** (*sync*) — advance everything advanceable; safe to run at
   any frequency, from anywhere that reaches the store.
 - **status** — per-subtask states and per-campaign rollups, human- and
   machine-readable.
+- **pause / resume / cancel** — campaign-level controls (§4.2), usable by
+  operators and by campaign authors on their own campaigns.
+- **promote** — move a campaign from the testing stage to production
+  (§4.2).
 - **doctor** — detect drift between store and reality (stale claims,
   missing workspaces, vanished units, orphaned reviews, orphaned
   workspaces); repair only with an explicit flag, logging every repair.
 - **retry** / **abandon** — operator overrides for individual subtasks.
 
+How author identity maps to permissions (who may pause or cancel whose
+campaign) is organization-specific and out of scope; the system MUST record
+the author so such policy can be enforced at the service boundary.
+
+### Authorship workflow
+
+A new campaign is wrong more often than it is right — the script breaks on
+unconsidered inputs, the decomposition is too coarse, the diff is not what
+the author intended. An implementation MUST support a testing workflow in
+which a campaign runs end-to-end — decompose, transform, verify, review,
+notify — while remaining invisible to code owners. Concretely, in the
+testing stage:
+
+- reviews MUST NOT request attention from code owners: marked as drafts,
+  opened against a test repository or test review system, or created
+  through a hermetic driver, per configuration;
+- notifications go to the author only (personal email, DM, …), not to
+  owner-facing channels;
+- the decomposition MAY be sampled (first N units) to keep iteration fast.
+
+The author iterates — inspect the draft reviews and logs, fix the script,
+re-test — and then **promotes**. Promotion abandons the testing subtasks
+(closing their reviews), and re-decomposes the campaign cleanly in the
+production stage with owner-facing review and notification policies in
+effect.
+
+### Execution modes
+
+The same lifecycle logic serves interactive use and service deployment: a
+one-shot reconcile command for operators and cron, and a long-running
+service that repeats the reconcile (and may add concurrency under the claim
+discipline of §4.1). These are thin shells over one shared engine — the
+business logic MUST NOT be duplicated per mode. Frequency affects only
+latency, never correctness.
+
 ## 8. Configuration
 
-A campaign is a declarative document naming the target repository and base
-revision, the decomposition rule, the two scripts, and the review and
-notification policies. The format is an implementation choice (HCL, TOML,
-JSON, …) but MUST support nested structure, string lists, comments, and
-embedded multi-line commands (decomposition-by-command is a required
+A campaign is a declarative document naming the author, the target
+repository and base revision, the decomposition rule, the two scripts, the
+review and notification policies, the campaign limits (§4.2), and the
+testing-stage overrides (§7). The format is an implementation choice (HCL,
+TOML, JSON, …) but MUST support nested structure, string lists, comments,
+and embedded multi-line commands (decomposition-by-command is a required
 capability, §6). Re-registering an updated document updates policy for
 *future* steps only; history is never rewound.
 
@@ -196,11 +270,15 @@ An implementation conforms to this specification if it:
 
 1. decomposes campaigns into per-unit subtasks and executes the script
    contract of §5;
-2. provides the lifecycle requirements of §4 on its chosen store;
-3. exposes the operator surface of §7;
+2. provides the lifecycle requirements of §4 — subtask and campaign — on
+   its chosen store;
+3. exposes the operator surface of §7, including campaign management and
+   the authorship workflow;
 4. isolates the boundaries of §6 behind replaceable interfaces, including
    at least one review driver that requires no external service (so the
-   full lifecycle is testable hermetically).
+   full lifecycle is testable hermetically);
+5. drives interactive and service execution modes through one shared
+   engine.
 
 ## 10. Relationship to the example implementation
 

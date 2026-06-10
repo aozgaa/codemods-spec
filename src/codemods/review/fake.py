@@ -40,7 +40,7 @@ class FakeReviewDriver:
                 return url
         url = f"fake://pr/{len(prs) + 1}"
         prs[url] = {"branch": branch, "base": base_branch, "title": title,
-                    "body": body, "state": "open"}
+                    "body": body, "state": "open", "draft": cfg.draft}
         _save(path, prs)
         return url
 

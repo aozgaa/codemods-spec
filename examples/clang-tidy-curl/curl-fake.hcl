@@ -5,6 +5,7 @@
 codemod "curl-tidy-braces-fake" {
   description = "local fake-review run of clang-tidy readability-braces-around-statements over curl lib/vauth"
 
+  author      = "aozgaa@gmail.com"
   repo        = "../../../curl"
   base_branch = "master"
 

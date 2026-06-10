@@ -42,6 +42,14 @@ TRANSITIONS: set[tuple[str, str]] = {
 TRANSITIONS |= {(s, ABANDONED) for s in ALL_STATES - TERMINAL}
 
 
+# Codemod-level lifecycle (EXAMPLE_SPEC.md §5.3).
+CM_ACTIVE = "active"
+CM_PAUSED = "paused"
+CM_CANCELLED = "cancelled"
+STAGE_TEST = "test"
+STAGE_PRODUCTION = "production"
+
+
 class IllegalTransition(Exception):
     pass
 

@@ -56,6 +56,7 @@ def project(tmp_path, upstream):
     write_script(proj / "postmod.sh", 'grep -q modded "$1/code.txt"\n')
     (proj / "demo.hcl").write_text(f'''
 codemod "demo" {{
+  author      = "author@example.com"
   repo        = "{upstream}"
   base_branch = "main"
   run         = "./run.sh"

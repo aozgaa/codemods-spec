@@ -8,13 +8,14 @@ a thin wrapper over this class.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
 import psycopg
 
 from . import db, state as st, worktree as wt
-from .config import CodemodConfig, load_config
+from .config import CodemodConfig, for_stage, load_config, sample_units
 from .decompose import decompose
 from .notify.base import Notifier, NotifyError, get_notifier
 from .review.base import ReviewDriver, get_review_driver
@@ -65,19 +66,30 @@ class Engine:
 
     # -- register (EXAMPLE_SPEC.md §7, §8) -----------------------------------------
 
-    def register(self, config_path: str | Path) -> dict:
+    def register(self, config_path: str | Path, test: bool = False) -> dict:
         cfg = load_config(config_path)
-        units = decompose(cfg)
-        return db.register(self.conn, cfg, str(Path(config_path).resolve()), units) | {
+        stage = st.STAGE_TEST if test else st.STAGE_PRODUCTION
+        units = sample_units(cfg, stage, decompose(cfg))
+        return db.register(self.conn, cfg, str(Path(config_path).resolve()),
+                           units, stage=stage) | {
             "name": cfg.name, "units": len(units),
         }
+
+    def _cfg(self, cm: dict) -> CodemodConfig:
+        """Stage-effective config for a codemod row (EXAMPLE_SPEC.md §3.4)."""
+        return for_stage(db.config_of(cm), cm["stage"])
 
     # -- sync: the reconciler (EXAMPLE_SPEC.md §7) ----------------------------------
 
     def sync(self, codemod_name: str | None = None, limit: int | None = None) -> list[Outcome]:
         outcomes = self.recover_stale()
         for cm in self._codemods(codemod_name):
-            cfg = db.config_of(cm)
+            if cm["status"] != st.CM_ACTIVE:
+                outcomes.append(Outcome(cm["name"], "*", "info",
+                                        f"skipped: codemod is {cm['status']}"
+                                        + (f" ({cm['status_reason']})" if cm["status_reason"] else "")))
+                continue
+            cfg = self._cfg(cm)
             n = 0
             for sub in db.list_subtasks(self.conn, cm["id"],
                                         states=sorted(st.ALL_STATES - st.TERMINAL)):
@@ -86,6 +98,37 @@ class Engine:
                 stepped = self._advance(cm, cfg, sub, outcomes)
                 n += 1 if stepped else 0
             outcomes += self._notify_pass(cm, cfg)
+            outcomes += self._auto_pause(cm, cfg)
+        return outcomes
+
+    def _auto_pause(self, cm: dict, cfg: CodemodConfig) -> list[Outcome]:
+        """Failure containment (SPEC.md §4.2): pause at limits.max_failures."""
+        limit = cfg.limits.max_failures
+        if limit <= 0:
+            return []
+        failures = db.count_subtasks(self.conn, cm["id"], [st.FAILED])
+        if failures < limit:
+            return []
+        reason = f"auto-paused: {failures} failed subtasks (limit {limit})"
+        db.set_codemod_status(self.conn, cm["id"], st.CM_PAUSED, reason)
+        cm["status"] = st.CM_PAUSED
+        outcomes = [Outcome(cfg.name, "*", "doctor", reason)]
+        notifier = self.notifier(cfg)
+        if notifier is not None and cfg.notify is not None:
+            author_notify = dataclasses.replace(cfg.notify, to=[cfg.author])
+            try:
+                notifier.send(author_notify, "paused", cfg.name, "*",
+                              f"[codemods] {cfg.name}: {reason}",
+                              f"codemod: {cfg.name}\nauthor: {cfg.author}\n{reason}\n"
+                              "Inspect failures with `codemods status`, fix the "
+                              "scripts, `codemods retry` the units, then "
+                              "`codemods resume`.")
+                db.record_notification(self.conn, None, "paused", cfg.notify.driver, "sent")
+            except NotifyError as e:
+                db.record_notification(self.conn, None, "paused", cfg.notify.driver,
+                                       "failed", {"error": str(e)})
+                outcomes.append(Outcome(cfg.name, "*", "warning",
+                                        f"pause notification failed: {e}"))
         return outcomes
 
     def _codemods(self, name: str | None) -> list[dict]:
@@ -172,6 +215,10 @@ class Engine:
             case st.VERIFIED:
                 if cfg.review is None:
                     return None  # rest state: no review configured
+                throttle = cfg.limits.max_open_reviews
+                if throttle > 0 and db.count_subtasks(
+                        self.conn, cm["id"], [st.PR_OPEN]) >= throttle:
+                    return None  # review throttle (SPEC.md §4.2); opens as PRs land
                 driver = self.review_driver(cfg)
                 if not Path(sub["worktree"] or "").exists():
                     return out("worktree missing; run `codemods doctor --fix`", "warning")
@@ -268,14 +315,16 @@ class Engine:
         cm, sub = self._find(codemod_name, unit)
         if sub["state"] in st.TERMINAL:
             raise ValueError(f"{unit!r} is already terminal ({sub['state']})")
-        cfg = db.config_of(cm)
+        self._abandon_subtask(self._cfg(cm), sub, "operator abandon")
+        return Outcome(codemod_name, unit, "step", "ABANDONED")
+
+    def _abandon_subtask(self, cfg: CodemodConfig, sub: dict, reason: str) -> None:
         if sub["pr_url"] and sub["state"] == st.PR_OPEN and cfg.review is not None:
             self.review_driver(cfg).close(
                 cfg.review, sub["pr_url"],
-                f"Abandoned by codemods operator ({cfg.name}/{unit}).")
+                f"Abandoned by codemods ({cfg.name}/{sub['unit']}): {reason}.")
         wt.discard(sub["worktree"] or "")
-        db.transition(self.conn, sub, st.ABANDONED, detail={"reason": "operator abandon"})
-        return Outcome(codemod_name, unit, "step", "ABANDONED")
+        db.transition(self.conn, sub, st.ABANDONED, detail={"reason": reason})
 
     def _find(self, codemod_name: str, unit: str) -> tuple[dict, dict]:
         cm = db.get_codemod(self.conn, codemod_name)
@@ -285,6 +334,58 @@ class Engine:
         if sub is None:
             raise LookupError(f"codemod {codemod_name!r} has no unit {unit!r}")
         return cm, sub
+
+    # -- campaign management (SPEC.md §4.2, EXAMPLE_SPEC.md §5.3) -------------
+
+    def pause(self, codemod_name: str, reason: str | None = None) -> Outcome:
+        cm = self._codemods(codemod_name)[0]
+        if cm["status"] != st.CM_ACTIVE:
+            raise ValueError(f"{codemod_name!r} is {cm['status']}, not active")
+        db.set_codemod_status(self.conn, cm["id"], st.CM_PAUSED,
+                              reason or "operator pause")
+        return Outcome(codemod_name, "*", "step", "paused")
+
+    def resume(self, codemod_name: str) -> Outcome:
+        cm = self._codemods(codemod_name)[0]
+        if cm["status"] != st.CM_PAUSED:
+            raise ValueError(f"{codemod_name!r} is {cm['status']}, not paused")
+        db.set_codemod_status(self.conn, cm["id"], st.CM_ACTIVE)
+        return Outcome(codemod_name, "*", "step", "resumed")
+
+    def cancel(self, codemod_name: str) -> list[Outcome]:
+        cm = self._codemods(codemod_name)[0]
+        if cm["status"] == st.CM_CANCELLED:
+            raise ValueError(f"{codemod_name!r} is already cancelled")
+        cfg = self._cfg(cm)
+        outcomes = []
+        for sub in db.list_subtasks(self.conn, cm["id"],
+                                    states=sorted(st.ALL_STATES - st.TERMINAL)):
+            self._abandon_subtask(cfg, sub, "codemod cancelled")
+            outcomes.append(Outcome(cfg.name, sub["unit"], "step", "ABANDONED (cancel)"))
+        db.set_codemod_status(self.conn, cm["id"], st.CM_CANCELLED, "operator cancel")
+        outcomes.append(Outcome(codemod_name, "*", "step", "cancelled"))
+        return outcomes
+
+    def promote(self, codemod_name: str) -> dict:
+        """Test stage -> production (EXAMPLE_SPEC.md §5.3): abandon the test
+        generation, bump the generation, re-decompose with production config."""
+        cm = self._codemods(codemod_name)[0]
+        if cm["stage"] != st.STAGE_TEST:
+            raise ValueError(f"{codemod_name!r} is in stage {cm['stage']!r}; "
+                             "only test-stage codemods can be promoted")
+        test_cfg = self._cfg(cm)
+        abandoned = 0
+        for sub in db.list_subtasks(self.conn, cm["id"],
+                                    states=sorted(st.ALL_STATES - st.TERMINAL)):
+            self._abandon_subtask(test_cfg, sub, "promoted to production")
+            abandoned += 1
+        prod_cfg = db.config_of(cm)
+        units = decompose(prod_cfg)
+        with self.conn.transaction():
+            generation = db.bump_generation(self.conn, cm["id"], st.STAGE_PRODUCTION)
+            new_units, _, _ = db.insert_units(self.conn, cm["id"], generation, units)
+        return {"name": codemod_name, "abandoned": abandoned,
+                "generation": generation, "units": len(new_units)}
 
     # -- doctor (EXAMPLE_SPEC.md §7) --------------------------------------------------
 
@@ -302,8 +403,7 @@ class Engine:
             findings.append(Outcome(sub["codemod_name"], sub["unit"], "doctor", msg))
 
         for cm in self._codemods(codemod_name):
-            cfg = db.config_of(cm)
-            findings += self._doctor_codemod(cm, cfg, fix)
+            findings += self._doctor_codemod(cm, self._cfg(cm), fix)
         return findings
 
     def _doctor_codemod(self, cm: dict, cfg: CodemodConfig, fix: bool) -> list[Outcome]:
@@ -323,7 +423,7 @@ class Engine:
 
         # Check 3: vanished units (decomposition no longer yields them).
         try:
-            units = set(decompose(cfg))
+            units = set(sample_units(cfg, cm["stage"], decompose(cfg)))
         except Exception as e:
             findings.append(Outcome(cfg.name, "*", "warning",
                                     f"cannot re-evaluate decomposition: {e}"))

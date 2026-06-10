@@ -8,6 +8,7 @@ from codemods.state import IllegalTransition
 def make_config(name="demo"):
     return CodemodConfig(
         name=name,
+        author="dev@example.com",
         repo="/tmp/repo",
         base_branch="main",
         run="/bin/true",

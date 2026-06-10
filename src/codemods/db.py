@@ -18,17 +18,23 @@ DEFAULT_LEASE_SECONDS = 3600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS codemods (
-  id          BIGSERIAL PRIMARY KEY,
-  name        TEXT UNIQUE NOT NULL,
-  config      JSONB NOT NULL,
-  config_path TEXT NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  id            BIGSERIAL PRIMARY KEY,
+  name          TEXT UNIQUE NOT NULL,
+  author        TEXT NOT NULL DEFAULT '',
+  config        JSONB NOT NULL,
+  config_path   TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active',
+  status_reason TEXT,
+  stage         TEXT NOT NULL DEFAULT 'production',
+  generation    INT NOT NULL DEFAULT 1,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS subtasks (
   id         BIGSERIAL PRIMARY KEY,
   codemod_id BIGINT NOT NULL REFERENCES codemods(id) ON DELETE CASCADE,
+  generation INT NOT NULL DEFAULT 1,
   unit       TEXT NOT NULL,
   unit_slug  TEXT NOT NULL,
   state      TEXT NOT NULL DEFAULT 'PENDING',
@@ -41,9 +47,20 @@ CREATE TABLE IF NOT EXISTS subtasks (
   claimed_by TEXT,
   claimed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (codemod_id, unit)
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- migrations-lite for databases created before the campaign-management
+-- columns existed (EXAMPLE_SPEC.md §5.3)
+ALTER TABLE codemods ADD COLUMN IF NOT EXISTS author TEXT NOT NULL DEFAULT '';
+ALTER TABLE codemods ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE codemods ADD COLUMN IF NOT EXISTS status_reason TEXT;
+ALTER TABLE codemods ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'production';
+ALTER TABLE codemods ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 1;
+ALTER TABLE subtasks ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 1;
+ALTER TABLE subtasks DROP CONSTRAINT IF EXISTS subtasks_codemod_id_unit_key;
+CREATE UNIQUE INDEX IF NOT EXISTS subtasks_codemod_gen_unit
+  ON subtasks (codemod_id, generation, unit);
 
 CREATE TABLE IF NOT EXISTS events (
   id         BIGSERIAL PRIMARY KEY,
@@ -101,49 +118,64 @@ def log_event(conn: psycopg.Connection, kind: str, *, codemod_id: int | None = N
 
 
 def register(conn: psycopg.Connection, config: CodemodConfig, config_path: str,
-             units: list[str]) -> dict[str, Any]:
+             units: list[str], stage: str = st.STAGE_PRODUCTION) -> dict[str, Any]:
     """Upsert codemod + insert subtasks for new units (EXAMPLE_SPEC.md §7, §8).
 
-    Returns {"codemod_id", "new", "existing", "vanished"}.
+    `stage` applies only when the codemod is first inserted; re-registering
+    never changes it (that is `promote`'s job). Subtasks are scoped to the
+    codemod's current generation. Returns
+    {"codemod_id", "new", "existing", "vanished"}.
     """
     with conn.transaction():
         row = conn.execute(
-            """INSERT INTO codemods (name, config, config_path)
-               VALUES (%s, %s, %s)
+            """INSERT INTO codemods (name, author, config, config_path, stage)
+               VALUES (%s, %s, %s, %s, %s)
                ON CONFLICT (name) DO UPDATE
                  SET config = EXCLUDED.config,
                      config_path = EXCLUDED.config_path,
+                     author = EXCLUDED.author,
                      updated_at = now()
-               RETURNING id""",
-            (config.name, Jsonb(config.to_dict()), config_path),
+               RETURNING id, generation""",
+            (config.name, config.author, Jsonb(config.to_dict()), config_path, stage),
         ).fetchone()
         codemod_id = row["id"]
-
-        existing = {
-            r["unit"]: r["unit_slug"]
-            for r in conn.execute(
-                "SELECT unit, unit_slug FROM subtasks WHERE codemod_id = %s",
-                (codemod_id,),
-            )
-        }
-        taken = set(existing.values())
-        new_units = [u for u in units if u not in existing]
-        for unit in new_units:
-            slug = slugify(unit, taken)
-            row = conn.execute(
-                "INSERT INTO subtasks (codemod_id, unit, unit_slug) VALUES (%s, %s, %s)"
-                " RETURNING id",
-                (codemod_id, unit, slug),
-            ).fetchone()
-            log_event(conn, "register", codemod_id=codemod_id, subtask_id=row["id"],
-                      to_state=st.PENDING, detail={"unit": unit})
-        vanished = sorted(set(existing) - set(units))
+        new_units, existing, vanished = insert_units(
+            conn, codemod_id, row["generation"], units)
         return {
             "codemod_id": codemod_id,
             "new": new_units,
-            "existing": len(existing),
+            "existing": existing,
             "vanished": vanished,
         }
+
+
+def insert_units(conn: psycopg.Connection, codemod_id: int, generation: int,
+                 units: list[str]) -> tuple[list[str], int, list[str]]:
+    """Insert PENDING subtasks for units new to this generation.
+
+    Returns (new_units, existing_count, vanished_units). Runs in the
+    caller's transaction.
+    """
+    existing = {
+        r["unit"]: r["unit_slug"]
+        for r in conn.execute(
+            "SELECT unit, unit_slug FROM subtasks"
+            " WHERE codemod_id = %s AND generation = %s",
+            (codemod_id, generation),
+        )
+    }
+    taken = set(existing.values())
+    new_units = [u for u in units if u not in existing]
+    for unit in new_units:
+        slug = slugify(unit, taken)
+        row = conn.execute(
+            "INSERT INTO subtasks (codemod_id, generation, unit, unit_slug)"
+            " VALUES (%s, %s, %s, %s) RETURNING id",
+            (codemod_id, generation, unit, slug),
+        ).fetchone()
+        log_event(conn, "register", codemod_id=codemod_id, subtask_id=row["id"],
+                  to_state=st.PENDING, detail={"unit": unit, "generation": generation})
+    return new_units, len(existing), sorted(set(existing) - set(units))
 
 
 def get_codemod(conn: psycopg.Connection, name: str) -> dict | None:
@@ -160,16 +192,21 @@ def config_of(row: dict) -> CodemodConfig:
 
 
 def get_subtask(conn: psycopg.Connection, codemod_id: int, unit: str) -> dict | None:
+    """The unit's subtask in the codemod's current generation."""
     return conn.execute(
-        "SELECT * FROM subtasks WHERE codemod_id = %s AND unit = %s",
+        "SELECT s.* FROM subtasks s JOIN codemods c ON c.id = s.codemod_id"
+        " WHERE s.codemod_id = %s AND s.unit = %s AND s.generation = c.generation",
         (codemod_id, unit),
     ).fetchone()
 
 
 def list_subtasks(conn: psycopg.Connection, codemod_id: int | None = None,
-                  states: list[str] | None = None) -> list[dict]:
+                  states: list[str] | None = None,
+                  current_generation_only: bool = True) -> list[dict]:
     q = "SELECT s.*, c.name AS codemod_name FROM subtasks s JOIN codemods c ON c.id = s.codemod_id"
     clauses, params = [], []
+    if current_generation_only:
+        clauses.append("s.generation = c.generation")
     if codemod_id is not None:
         clauses.append("s.codemod_id = %s")
         params.append(codemod_id)
@@ -180,6 +217,42 @@ def list_subtasks(conn: psycopg.Connection, codemod_id: int | None = None,
         q += " WHERE " + " AND ".join(clauses)
     q += " ORDER BY c.name, s.id"
     return conn.execute(q, params).fetchall()
+
+
+def count_subtasks(conn: psycopg.Connection, codemod_id: int, states: list[str]) -> int:
+    """Current-generation subtasks of `codemod_id` in any of `states`."""
+    return conn.execute(
+        "SELECT count(*) AS n FROM subtasks s JOIN codemods c ON c.id = s.codemod_id"
+        " WHERE s.codemod_id = %s AND s.generation = c.generation AND s.state = ANY(%s)",
+        (codemod_id, states),
+    ).fetchone()["n"]
+
+
+def set_codemod_status(conn: psycopg.Connection, codemod_id: int, status: str,
+                       reason: str | None = None) -> None:
+    with conn.transaction():
+        conn.execute(
+            "UPDATE codemods SET status = %s, status_reason = %s, updated_at = now()"
+            " WHERE id = %s",
+            (status, reason, codemod_id),
+        )
+        log_event(conn, "codemod_status", codemod_id=codemod_id, to_state=status,
+                  detail={"reason": reason} if reason else None)
+
+
+def bump_generation(conn: psycopg.Connection, codemod_id: int, stage: str) -> int:
+    """Start a fresh generation in `stage` (promote, EXAMPLE_SPEC.md §5.3).
+
+    Runs in the caller's transaction; returns the new generation."""
+    row = conn.execute(
+        "UPDATE codemods SET generation = generation + 1, stage = %s,"
+        " status = %s, status_reason = NULL, updated_at = now()"
+        " WHERE id = %s RETURNING generation",
+        (stage, st.CM_ACTIVE, codemod_id),
+    ).fetchone()
+    log_event(conn, "promote", codemod_id=codemod_id,
+              detail={"generation": row["generation"], "stage": stage})
+    return row["generation"]
 
 
 def transition(conn: psycopg.Connection, subtask: dict, to_state: str, *,
@@ -259,7 +332,7 @@ def stale_claims(conn: psycopg.Connection,
     return out
 
 
-def record_notification(conn: psycopg.Connection, subtask_id: int, event: str,
+def record_notification(conn: psycopg.Connection, subtask_id: int | None, event: str,
                         driver: str, status: str, detail: dict | None = None) -> None:
     with conn.transaction():
         conn.execute(
